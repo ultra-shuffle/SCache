@@ -59,7 +59,7 @@ private[deploy] class ClientArguments(args: Array[String], conf: ScacheConf) ext
   var masterPort = 6388
 
   masterIp = conf.getString("scache.master.ip", masterIp)
-  port = conf.getInt("scache.clent.port", port)
+  port = conf.getInt("scache.client.port", port)
   masterPort = conf.getInt("scache.master.port", masterPort)
 
 
