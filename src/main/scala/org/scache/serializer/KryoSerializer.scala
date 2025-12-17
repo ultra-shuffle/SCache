@@ -475,7 +475,7 @@ private object JavaIterableWrapperSerializer extends Logging {
   // The class returned by JavaConverters.asJava
   // (scala.collection.convert.Wrappers$IterableWrapper).
   val wrapperClass =
-    scala.collection.convert.WrapAsJava.asJavaIterable(Seq(1)).getClass
+    scala.collection.Iterable(1).asJava.getClass
 
   // Get the underlying method so we can use it to get the Scala collection for serialization.
   private val underlyingMethodOpt = {

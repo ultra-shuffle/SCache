@@ -23,7 +23,7 @@ import org.scache.MapOutputTrackerMaster
 
 import scala.collection.mutable
 import scala.collection.JavaConverters._
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
 import org.scache.util.{ScacheConf, Logging, Utils, ThreadUtils}
 import org.scache.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.scache.storage.BlockManagerMessages._
@@ -50,7 +50,8 @@ class BlockManagerMasterEndpoint(
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
 
   private val askThreadPool = ThreadUtils.newDaemonCachedThreadPool("block-manager-ask-thread-pool")
-  private implicit val askExecutionContext = ExecutionContext.fromExecutorService(askThreadPool)
+  private implicit val askExecutionContext: ExecutionContextExecutorService =
+    ExecutionContext.fromExecutorService(askThreadPool)
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
     case RegisterBlockManager(blockManagerId, maxMemSize, slaveEndpoint) =>

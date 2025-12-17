@@ -277,7 +277,7 @@ private[scache] object StorageUtils extends Logging {
         blockLocations.getOrElseUpdate(bid, mutable.ListBuffer.empty) += location
       }
     }
-    blockLocations
+    blockLocations.iterator.map { case (bid, locs) => (bid, locs.toSeq) }.toMap
   }
 
 }

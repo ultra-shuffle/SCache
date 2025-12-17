@@ -21,7 +21,7 @@ import java.io.Serializable
 import java.util.{PriorityQueue => JPriorityQueue}
 
 import scala.collection.JavaConverters._
-import scala.collection.generic.Growable
+import scala.collection.mutable.Growable
 
 /**
  * Bounded priority queue. This class wraps the original PriorityQueue
@@ -37,12 +37,9 @@ private[scache] class BoundedPriorityQueue[A](maxSize: Int)(implicit ord: Orderi
 
   override def size: Int = underlying.size
 
-  override def ++=(xs: TraversableOnce[A]): this.type = {
-    xs.foreach { this += _ }
-    this
-  }
+  override def knownSize: Int = size
 
-  override def +=(elem: A): this.type = {
+  override def addOne(elem: A): this.type = {
     if (size < maxSize) {
       underlying.offer(elem)
     } else {
@@ -51,11 +48,7 @@ private[scache] class BoundedPriorityQueue[A](maxSize: Int)(implicit ord: Orderi
     this
   }
 
-  override def +=(elem1: A, elem2: A, elems: A*): this.type = {
-    this += elem1 += elem2 ++= elems
-  }
-
-  override def clear() { underlying.clear() }
+  override def clear(): Unit = underlying.clear()
 
   private def maybeReplaceLowest(a: A): Boolean = {
     val head = underlying.peek()

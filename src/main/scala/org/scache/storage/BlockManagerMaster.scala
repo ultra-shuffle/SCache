@@ -17,9 +17,8 @@
 
 package org.scache.storage
 
-import scala.collection.Iterable
-import scala.collection.generic.CanBuildFrom
 import scala.concurrent.Future
+import scala.util.{Failure, Success}
 
 import org.scache.util.{ScacheConf, Logging, RpcUtils, ThreadUtils}
 import org.scache.rpc.RpcEndpointRef
@@ -35,7 +34,7 @@ class BlockManagerMaster(
   val timeout = RpcUtils.askRpcTimeout(conf)
 
   /** Remove a dead executor from the driver endpoint. This is only called on the driver side. */
-  def removeExecutor(execId: String) {
+  def removeExecutor(execId: String): Unit = {
     tell(RemoveExecutor(execId))
     logInfo("Removed " + execId + " successfully in removeExecutor")
   }
@@ -43,7 +42,7 @@ class BlockManagerMaster(
   /** Request removal of a dead executor from the driver endpoint.
    *  This is only called on the driver side. Non-blocking
    */
-  def removeExecutorAsync(execId: String) {
+  def removeExecutorAsync(execId: String): Unit = {
     driverEndpoint.ask[Boolean](RemoveExecutor(execId))
     logInfo("Removal of executor " + execId + " requested")
   }
@@ -104,16 +103,17 @@ class BlockManagerMaster(
    * Remove a block from the slaves that have it. This can only be used to remove
    * blocks that the driver knows about.
    */
-  def removeBlock(blockId: BlockId) {
+  def removeBlock(blockId: BlockId): Unit = {
     driverEndpoint.askWithRetry[Boolean](RemoveBlock(blockId))
   }
 
   /** Remove all blocks belonging to the given RDD. */
-  def removeRdd(rddId: Int, blocking: Boolean) {
+  def removeRdd(rddId: Int, blocking: Boolean): Unit = {
     val future = driverEndpoint.askWithRetry[Future[Seq[Int]]](RemoveRdd(rddId))
-    future.onFailure {
-      case e: Exception =>
+    future.onComplete {
+      case Failure(e: Exception) =>
         logWarning(s"Failed to remove RDD $rddId - ${e.getMessage}", e)
+      case _ =>
     }(ThreadUtils.sameThread)
     if (blocking) {
       timeout.awaitResult(future)
@@ -121,11 +121,12 @@ class BlockManagerMaster(
   }
 
   /** Remove all blocks belonging to the given shuffle. */
-  def removeShuffle(shuffleId: Int, blocking: Boolean) {
+  def removeShuffle(shuffleId: Int, blocking: Boolean): Unit = {
     val future = driverEndpoint.askWithRetry[Future[Seq[Boolean]]](RemoveShuffle(shuffleId))
-    future.onFailure {
-      case e: Exception =>
+    future.onComplete {
+      case Failure(e: Exception) =>
         logWarning(s"Failed to remove shuffle $shuffleId - ${e.getMessage}", e)
+      case _ =>
     }(ThreadUtils.sameThread)
     if (blocking) {
       timeout.awaitResult(future)
@@ -133,13 +134,14 @@ class BlockManagerMaster(
   }
 
   /** Remove all blocks belonging to the given broadcast. */
-  def removeBroadcast(broadcastId: Long, removeFromMaster: Boolean, blocking: Boolean) {
+  def removeBroadcast(broadcastId: Long, removeFromMaster: Boolean, blocking: Boolean): Unit = {
     val future = driverEndpoint.askWithRetry[Future[Seq[Int]]](
       RemoveBroadcast(broadcastId, removeFromMaster))
-    future.onFailure {
-      case e: Exception =>
+    future.onComplete {
+      case Failure(e: Exception) =>
         logWarning(s"Failed to remove broadcast $broadcastId" +
           s" with removeFromMaster = $removeFromMaster - ${e.getMessage}", e)
+      case _ =>
     }(ThreadUtils.sameThread)
     if (blocking) {
       timeout.awaitResult(future)
@@ -180,14 +182,10 @@ class BlockManagerMaster(
     val response = driverEndpoint.
       askWithRetry[Map[BlockManagerId, Future[Option[BlockStatus]]]](msg)
     val (blockManagerIds, futures) = response.unzip
-    implicit val sameThread = ThreadUtils.sameThread
-    val cbf =
-      implicitly[
-        CanBuildFrom[Iterable[Future[Option[BlockStatus]]],
-        Option[BlockStatus],
-        Iterable[Option[BlockStatus]]]]
+    val futuresSeq = futures.toSeq
+    implicit val sameThread: scala.concurrent.ExecutionContext = ThreadUtils.sameThread
     val blockStatus = timeout.awaitResult(
-      Future.sequence[Option[BlockStatus], Iterable](futures)(cbf, ThreadUtils.sameThread))
+      Future.sequence(futuresSeq))
     if (blockStatus == null) {
       throw new Exception("BlockManager returned null for BlockStatus query: " + blockId)
     }
@@ -221,7 +219,7 @@ class BlockManagerMaster(
   }
 
   /** Stop the driver endpoint, called only on the Spark driver node */
-  def stop() {
+  def stop(): Unit = {
     if (driverEndpoint != null && isDriver) {
       tell(StopBlockManagerMaster)
       driverEndpoint = null
@@ -230,7 +228,7 @@ class BlockManagerMaster(
   }
 
   /** Send a one-way message to the master endpoint, to which we expect it to reply with true. */
-  private def tell(message: Any) {
+  private def tell(message: Any): Unit = {
     if (!driverEndpoint.askWithRetry[Boolean](message)) {
       throw new Exception("BlockManagerMasterEndpoint returned false, expected true.")
     }

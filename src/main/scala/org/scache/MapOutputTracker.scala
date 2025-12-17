@@ -390,6 +390,6 @@ private[scache] object MapOutputTracker extends Logging {
       }
     }
 
-    splitsByAddress.toSeq
+    splitsByAddress.toSeq.map { case (bmId, blocks) => (bmId, blocks.toSeq) }
   }
 }

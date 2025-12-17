@@ -84,15 +84,15 @@ private[scache] class DiskBlockManager(conf: ScacheConf, deleteFilesOnStop: Bool
   /** List all the files currently stored on disk by the disk manager. */
   def getAllFiles(): Seq[File] = {
     // Get all the files inside the array of array of directories
-    subDirs.flatMap { dir =>
+    subDirs.iterator.flatMap { dir =>
       dir.synchronized {
         // Copy the content of dir because it may be modified in other threads
         dir.clone()
       }
     }.filter(_ != null).flatMap { dir =>
       val files = dir.listFiles()
-      if (files != null) files else Seq.empty
-    }
+      if (files != null) files.toSeq else Seq.empty
+    }.toSeq
   }
 
   /** List all the blocks currently stored on disk by the disk manager. */

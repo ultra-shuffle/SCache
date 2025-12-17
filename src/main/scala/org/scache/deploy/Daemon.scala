@@ -13,7 +13,8 @@ import org.scache.util._
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.util.{Failure, Success}
 
 /**
   * Created by frankfzw on 16-10-31.
@@ -27,7 +28,8 @@ class Daemon(
   System.setProperty("SCACHE_DAEMON", s"daemon-${Utils.findLocalInetAddress().getHostName}")
   private val asyncThreadPool =
     ThreadUtils.newDaemonCachedThreadPool("scache-daemon-async-thread-pool")
-  private implicit val asyncExecutionContext = ExecutionContext.fromExecutorService(asyncThreadPool)
+  private implicit val asyncExecutionContext: ExecutionContextExecutorService =
+    ExecutionContext.fromExecutorService(asyncThreadPool)
 
   private val conf = new ScacheConf(scacheHome)
   private val clientPort = conf.getInt("scache.client.port", 5678)
@@ -109,16 +111,16 @@ class Daemon(
     asyncThreadPool.shutdownNow()
   }
 
-  private def doAsync[T](actionMessage: String)(body: => T) {
+  private def doAsync[T](actionMessage: String)(body: => T): Unit = {
     val future = Future {
       logDebug(actionMessage)
       body
     }
-    future.onSuccess { case response =>
-      logDebug("Done " + actionMessage + ", response is " + response)
-    }
-    future.onFailure { case t: Throwable =>
-      logError("Error in " + actionMessage, t)
+    future.onComplete {
+      case Success(response) =>
+        logDebug("Done " + actionMessage + ", response is " + response)
+      case Failure(t) =>
+        logError("Error in " + actionMessage, t)
     }
   }
 }

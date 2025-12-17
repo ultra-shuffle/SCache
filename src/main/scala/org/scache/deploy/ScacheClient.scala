@@ -22,7 +22,7 @@ import org.scache.util._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.Duration
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutorService, Future}
 import scala.util.control.Exception
 import scala.util.{Failure, Random, Success}
 
@@ -80,7 +80,8 @@ class ScacheClient(
   // create the future context for client
   private val asyncThreadPool =
     ThreadUtils.newDaemonCachedThreadPool("block-manager-slave-async-thread-pool")
-  private implicit val asyncExecutionContext = ExecutionContext.fromExecutorService(asyncThreadPool)
+  private implicit val asyncExecutionContext: ExecutionContextExecutorService =
+    ExecutionContext.fromExecutorService(asyncThreadPool)
 
 
   override def onStop(): Unit = {
@@ -261,19 +262,19 @@ class ScacheClient(
     }
   }
 
-  private def doAsync[T](actionMessage: String, context: RpcCallContext)(body: => T) {
+  private def doAsync[T](actionMessage: String, context: RpcCallContext)(body: => T): Unit = {
     val future = Future {
       logDebug(actionMessage)
       body
     }
-    future.onSuccess { case response =>
-      logDebug("Done " + actionMessage + ", response is " + response)
-      context.reply(response)
-      logDebug("Sent response: " + response + " to " + context.senderAddress)
-    }
-    future.onFailure { case t: Throwable =>
-      logError("Error in " + actionMessage, t)
-      context.sendFailure(t)
+    future.onComplete {
+      case Success(response) =>
+        logDebug("Done " + actionMessage + ", response is " + response)
+        context.reply(response)
+        logDebug("Sent response: " + response + " to " + context.senderAddress)
+      case Failure(t) =>
+        logError("Error in " + actionMessage, t)
+        context.sendFailure(t)
     }
   }
 }

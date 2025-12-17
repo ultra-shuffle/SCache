@@ -21,7 +21,6 @@ import java.util.concurrent._
 
 import scala.concurrent.{Await, Awaitable, ExecutionContext, ExecutionContextExecutor}
 import scala.concurrent.duration.Duration
-import scala.concurrent.forkjoin.{ForkJoinPool => SForkJoinPool, ForkJoinWorkerThread => SForkJoinWorkerThread}
 import scala.util.control.NonFatal
 
 import com.google.common.util.concurrent.{MoreExecutors, ThreadFactoryBuilder}
@@ -163,18 +162,16 @@ private[scache] object ThreadUtils {
   /**
    * Construct a new Scala ForkJoinPool with a specified max parallelism and name prefix.
    */
-  def newForkJoinPool(prefix: String, maxThreadNumber: Int): SForkJoinPool = {
+  def newForkJoinPool(prefix: String, maxThreadNumber: Int): ForkJoinPool = {
     // Custom factory to set thread names
-    val factory = new SForkJoinPool.ForkJoinWorkerThreadFactory {
-      override def newThread(pool: SForkJoinPool) =
-        new SForkJoinWorkerThread(pool) {
-          setName(prefix + "-" + super.getName)
-        }
+    val factory = new ForkJoinPool.ForkJoinWorkerThreadFactory {
+      override def newThread(pool: ForkJoinPool): ForkJoinWorkerThread = {
+        val thread = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool)
+        thread.setName(prefix + "-" + thread.getName)
+        thread
+      }
     }
-    new SForkJoinPool(maxThreadNumber, factory,
-      null, // handler
-      false // asyncMode
-    )
+    new ForkJoinPool(maxThreadNumber, factory, null /* handler */, false /* asyncMode */)
   }
 
   // scalastyle:off awaitresult

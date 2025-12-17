@@ -17,7 +17,8 @@
 
 package org.scache.storage
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.util.{Failure, Success}
 
 import org.scache.MapOutputTracker
 import org.scache.util.Logging
@@ -38,7 +39,8 @@ class BlockManagerSlaveEndpoint(
 
   private val asyncThreadPool =
     ThreadUtils.newDaemonCachedThreadPool("block-manager-slave-async-thread-pool")
-  private implicit val asyncExecutionContext = ExecutionContext.fromExecutorService(asyncThreadPool)
+  private implicit val asyncExecutionContext: ExecutionContextExecutorService =
+    ExecutionContext.fromExecutorService(asyncThreadPool)
 
   // Operations that involve removing blocks may be slow and should be done asynchronously
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
@@ -61,19 +63,19 @@ class BlockManagerSlaveEndpoint(
 
   }
 
-  private def doAsync[T](actionMessage: String, context: RpcCallContext)(body: => T) {
+  private def doAsync[T](actionMessage: String, context: RpcCallContext)(body: => T): Unit = {
     val future = Future {
       logDebug(actionMessage)
       body
     }
-    future.onSuccess { case response =>
-      logDebug("Done " + actionMessage + ", response is " + response)
-      context.reply(response)
-      logDebug("Sent response: " + response + " to " + context.senderAddress)
-    }
-    future.onFailure { case t: Throwable =>
-      logError("Error in " + actionMessage, t)
-      context.sendFailure(t)
+    future.onComplete {
+      case Success(response) =>
+        logDebug("Done " + actionMessage + ", response is " + response)
+        context.reply(response)
+        logDebug("Sent response: " + response + " to " + context.senderAddress)
+      case Failure(t) =>
+        logError("Error in " + actionMessage, t)
+        context.sendFailure(t)
     }
   }
 
