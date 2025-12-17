@@ -2,7 +2,14 @@ name := "SCache"
 
 organization := "org.scache"
 
-scalaVersion := "2.10.5"
+scalaVersion := "2.13.18"
+
+// Prefer local Maven cache (helps when working offline / in restricted-network environments).
+resolvers += Resolver.mavenLocal
+
+// Scaladoc may warn about unresolved @link targets (especially from Java sources).
+// Suppress those link warnings so `sbt doc` output is clean.
+Compile / doc / scalacOptions ++= Seq("-no-link-warnings")
 
 libraryDependencies ++= Seq(
   "log4j" % "log4j" % "1.2.17",
@@ -11,8 +18,9 @@ libraryDependencies ++= Seq(
   "com.typesafe" % "config" % "1.2.1",
   "com.google.guava" % "guava" % "17.0",
   "com.google.code.findbugs" % "jsr305" % "3.0.0",
-  "io.netty" % "netty-all" % "4.0.29.Final",
-  "io.netty" % "netty" % "3.8.0.Final",
+  // Keep Netty aligned with modern runtimes (e.g., Spark 3.x) to avoid
+  // binary incompatibilities like AbstractMethodError in ReferenceCounted.
+  "io.netty" % "netty-all" % "4.1.96.Final",
   "com.esotericsoftware.kryo" % "kryo" % "2.21",
   "org.apache.avro" % "avro" % "1.7.7",
   "commons-io" % "commons-io" % "2.4",
@@ -28,6 +36,7 @@ libraryDependencies ++= Seq(
 
 
 assemblyMergeStrategy in assembly := {
+  case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.first
   case PathList("org", "apache", xs @ _*) => MergeStrategy.first
   case PathList("com", "esotericsoftware", xs @ _*) => MergeStrategy.first
   case PathList("org", "objenesis", xs @ _*) => MergeStrategy.first
