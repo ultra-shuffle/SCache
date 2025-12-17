@@ -21,8 +21,6 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-
-import sun.misc.Cleaner;
 import sun.misc.Unsafe;
 
 public final class Platform {
@@ -162,13 +160,28 @@ public final class Platform {
       cleanerField.setAccessible(true);
       final long memory = allocateMemory(size);
       ByteBuffer buffer = (ByteBuffer) constructor.newInstance(memory, size);
-      Cleaner cleaner = Cleaner.create(buffer, new Runnable() {
+      Runnable cleanup = new Runnable() {
         @Override
         public void run() {
           freeMemory(memory);
         }
-      });
-      cleanerField.set(buffer, cleaner);
+      };
+
+      // Avoid compile-time dependency on sun.misc.Cleaner / jdk.internal.ref.Cleaner.
+      // Newer JDKs removed sun.misc.Cleaner, and DirectByteBuffer may use an internal Cleaner.
+      try {
+        Class<?> cleanerClass = cleanerField.getType();
+        Method createMethod = cleanerClass.getMethod("create", Object.class, Runnable.class);
+        Object cleaner = createMethod.invoke(null, buffer, cleanup);
+        cleanerField.set(buffer, cleaner);
+      } catch (Throwable ignored) {
+        // Fallback for JDKs where DirectByteBuffer's cleaner field cannot be set.
+        try {
+          java.lang.ref.Cleaner.create().register(buffer, cleanup);
+        } catch (Throwable t) {
+          throwException(t);
+        }
+      }
       return buffer;
     } catch (Exception e) {
       throwException(e);
