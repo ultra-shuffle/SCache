@@ -288,6 +288,7 @@ object ScacheClient extends Logging{
     conf.set("scache.rpc.askTimeout", "10")
     logInfo("Start Client")
     conf.set("scache.driver.host", arguements.masterIp)
+    conf.set("scache.driver.port", arguements.masterPort.toString)
     conf.set("scache.app.id", "test")
 
     val masterRpcAddress = RpcAddress(arguements.masterIp, arguements.masterPort)

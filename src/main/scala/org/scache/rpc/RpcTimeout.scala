@@ -17,6 +17,7 @@
 
 package org.scache.rpc
 
+import java.io.{InvalidObjectException, ObjectInputStream, ObjectStreamException}
 import java.util.concurrent.TimeoutException
 
 import scala.concurrent.{Await, Future}
@@ -40,8 +41,19 @@ private[rpc] class RpcTimeoutException(message: String, cause: TimeoutException)
  * @param duration timeout duration in seconds
  * @param timeoutProp the configuration property that controls this timeout
  */
+@SerialVersionUID(1L)
 private[scache] class RpcTimeout(val duration: FiniteDuration, val timeoutProp: String)
   extends Serializable {
+
+  @throws[ObjectStreamException]
+  private def writeReplace(): AnyRef = {
+    new RpcTimeout.SerializationProxy(duration.toNanos, timeoutProp)
+  }
+
+  @throws[ObjectStreamException]
+  private def readObject(in: ObjectInputStream): Unit = {
+    throw new InvalidObjectException("Use SerializationProxy")
+  }
 
   /** Amends the standard message of TimeoutException to include the description */
   private def createRpcTimeoutException(te: TimeoutException): RpcTimeoutException = {
@@ -86,6 +98,14 @@ private[scache] class RpcTimeout(val duration: FiniteDuration, val timeoutProp: 
 
 
 private[scache] object RpcTimeout {
+
+  @SerialVersionUID(1L)
+  private class SerializationProxy(durationNanos: Long, timeoutProp: String) extends Serializable {
+    @throws[ObjectStreamException]
+    private def readResolve(): AnyRef = {
+      new RpcTimeout(durationNanos.nanos, timeoutProp)
+    }
+  }
 
   /**
    * Lookup the timeout property in the configuration and create
