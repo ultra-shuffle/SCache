@@ -1,5 +1,65 @@
 #!/bin/bash
 
-PID=`jps | grep ScacheMaster | awk '{print $1}'`
+set -euo pipefail
 
-kill $PID
+sbin=`dirname "$0"`
+sbin=`cd "$sbin"; pwd`
+
+. "$sbin/config.sh"
+
+MAIN_CLASS="org.scache.deploy.ScacheMaster"
+PID_FILE="$SCACHE_PID_DIR/scache-master.pid"
+
+is_pid_running() {
+	local pid="$1"
+	[[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+pid_matches_main() {
+	local pid="$1"
+	ps -p "$pid" -o args= 2>/dev/null | grep -Fq "$MAIN_CLASS"
+}
+
+kill_and_wait() {
+	local pid="$1"
+	local timeout_secs="${2:-15}"
+
+	if ! is_pid_running "$pid"; then
+		return 0
+	fi
+
+	echo "Stopping ScacheMaster (pid=$pid)"
+	kill "$pid" 2>/dev/null || true
+	local waited=0
+	while is_pid_running "$pid" && [[ $waited -lt $timeout_secs ]]; do
+		sleep 1
+		waited=$((waited + 1))
+	done
+	if is_pid_running "$pid"; then
+		echo "ScacheMaster did not stop in ${timeout_secs}s; sending SIGKILL" >&2
+		kill -9 "$pid" 2>/dev/null || true
+	fi
+}
+
+pid=""
+if [[ -f "$PID_FILE" ]]; then
+	pid=$(cat "$PID_FILE" 2>/dev/null || true)
+fi
+
+if [[ -n "$pid" ]] && is_pid_running "$pid" && pid_matches_main "$pid"; then
+	kill_and_wait "$pid"
+	rm -f "$PID_FILE"
+	echo "ScacheMaster stopped"
+	exit 0
+fi
+
+# Fallback: locate by process command line.
+pid=$(pgrep -u "$(id -u)" -f "$MAIN_CLASS" | head -n 1 || true)
+if [[ -n "$pid" ]]; then
+	kill_and_wait "$pid"
+	rm -f "$PID_FILE" || true
+	echo "ScacheMaster stopped"
+	exit 0
+fi
+
+echo "ScacheMaster not running"
