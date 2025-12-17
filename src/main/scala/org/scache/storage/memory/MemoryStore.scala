@@ -307,10 +307,10 @@ private[storage] class MemoryStore(
 
     require(!contains(blockId), s"Block $blockId is already present in the MemoryStore")
 
-    // TODO: add OFF_HEAP allocator
     val allocator = memoryMode match {
       case MemoryMode.ON_HEAP => ByteBuffer.allocate _
-      // case MemoryMode.OFF_HEAP => Platform.allocateDirectBuffer _
+      // Fall back to heap allocation for OFF_HEAP until a dedicated allocator is wired in.
+      case MemoryMode.OFF_HEAP => ByteBuffer.allocate _
     }
 
     // Whether there is still enough memory for us to continue unrolling this block
