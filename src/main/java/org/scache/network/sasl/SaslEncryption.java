@@ -32,9 +32,9 @@ import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.FileRegion;
 import io.netty.handler.codec.MessageToMessageDecoder;
-import io.netty.util.AbstractReferenceCounted;
 
 import org.scache.network.util.ByteArrayWritableChannel;
+import org.scache.network.util.AbstractFileRegion;
 import org.scache.network.util.NettyUtils;
 
 /**
@@ -129,7 +129,7 @@ class SaslEncryption {
   }
 
   @VisibleForTesting
-  static class EncryptedMessage extends AbstractReferenceCounted implements FileRegion {
+  static class EncryptedMessage extends AbstractFileRegion {
 
     private final SaslEncryptionBackend backend;
     private final boolean isByteBuf;
@@ -183,8 +183,43 @@ class SaslEncryption {
      * Returns an approximation of the amount of data transferred. See {@link #count()}.
      */
     @Override
-    public long transfered() {
+    public long transferred() {
       return transferred;
+    }
+
+    @Override
+    public EncryptedMessage touch(Object o) {
+      super.touch(o);
+      if (buf != null) {
+        buf.touch(o);
+      }
+      if (region != null) {
+        region.touch(o);
+      }
+      return this;
+    }
+
+    @Override
+    public EncryptedMessage retain(int increment) {
+      super.retain(increment);
+      if (buf != null) {
+        buf.retain(increment);
+      }
+      if (region != null) {
+        region.retain(increment);
+      }
+      return this;
+    }
+
+    @Override
+    public boolean release(int decrement) {
+      if (region != null) {
+        region.release(decrement);
+      }
+      if (buf != null) {
+        buf.release(decrement);
+      }
+      return super.release(decrement);
     }
 
     /**
@@ -205,7 +240,7 @@ class SaslEncryption {
     public long transferTo(final WritableByteChannel target, final long position)
       throws IOException {
 
-      Preconditions.checkArgument(position == transfered(), "Invalid position.");
+      Preconditions.checkArgument(position == transferred(), "Invalid position.");
 
       long reportedWritten = 0L;
       long actuallyWritten = 0L;
@@ -237,7 +272,7 @@ class SaslEncryption {
           currentChunkSize = 0;
           currentReportedBytes = 0;
         }
-      } while (currentChunk == null && transfered() + reportedWritten < count());
+      } while (currentChunk == null && transferred() + reportedWritten < count());
 
       // Returning 0 triggers a backoff mechanism in netty which may harm performance. Instead,
       // we return 1 until we can (i.e. until the reported count would actually match the size
@@ -262,7 +297,7 @@ class SaslEncryption {
         int copied = byteChannel.write(buf.nioBuffer());
         buf.skipBytes(copied);
       } else {
-        region.transferTo(byteChannel, region.transfered());
+        region.transferTo(byteChannel, region.transferred());
       }
 
       byte[] encrypted = backend.wrap(byteChannel.getData(), 0, byteChannel.length());
