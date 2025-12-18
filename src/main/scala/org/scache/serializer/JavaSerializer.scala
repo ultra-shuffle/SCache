@@ -60,15 +60,32 @@ private[scache] class JavaDeserializationStream(in: InputStream, loader: ClassLo
   extends DeserializationStream {
 
   private val objIn = new ObjectInputStream(in) {
-    override def resolveClass(desc: ObjectStreamClass): Class[_] =
-      try {
-        // scalastyle:off classforname
-        Class.forName(desc.getName, false, loader)
-        // scalastyle:on classforname
-      } catch {
-        case e: ClassNotFoundException =>
-          JavaDeserializationStream.primitiveMappings.getOrElse(desc.getName, throw e)
+    override def resolveClass(desc: ObjectStreamClass): Class[_] = {
+      val className = desc.getName
+      val classLoaders = Seq(
+        loader,
+        Thread.currentThread().getContextClassLoader,
+        Utils.getScacheClassLoader
+      ).distinct.filter(_ != null)
+
+      var lastException: ClassNotFoundException = null
+      val classLoaderIter = classLoaders.iterator
+      while (classLoaderIter.hasNext) {
+        val classLoader = classLoaderIter.next()
+        try {
+          // scalastyle:off classforname
+          return Class.forName(className, false, classLoader)
+          // scalastyle:on classforname
+        } catch {
+          case e: ClassNotFoundException =>
+            lastException = e
+        }
       }
+
+      JavaDeserializationStream.primitiveMappings.getOrElse(
+        className,
+        throw Option(lastException).getOrElse(new ClassNotFoundException(className)))
+    }
   }
 
   def readObject[T: ClassTag](): T = objIn.readObject().asInstanceOf[T]
