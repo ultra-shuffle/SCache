@@ -1,97 +1,95 @@
 # SCache
 
-For more detail, you can read our paper: [Efficient shuffle management with scache for dag computing frameworks](https://dl.acm.org/citation.cfm?id=3178510)
+SCache is a shuffle cache/daemon integrated with the local Hadoop + Spark trees in this workspace.
 
-- [System Overview](#system-overview)
+The previous (upstream-style) README is archived as `README.old.md`.
 
-- [Performance](#performance)
-    - [Hadoop Mapreduce with SCache](#hadoop-mapreduce-with-scache)
-    - [Spark with SCache](#spark-with-scache)
+## Dependencies (local git repos)
 
-- [How to Use SCache](#how-to-use-scache)
+SCache now depends on these repositories being present at the following paths:
 
-System Overview
---
+- `${HOME}/hadoop/`
+- `${HOME}/spark-3.5/`
+- `${HOME}/spark-apps/`
+- `${HOME}/spark-apps/HiBench-7.1.1/`
 
-SCache is a distributed memory cache system that particularly focuses on shuffle optimization. By extracting and analyzing shuffle dependencies prior to the actual task execution, SCache can adopt heuristic pre-scheduling combining with shuffle size prediction to pre-fetch shuffle data and balance load on each node. Meanwhile, SCache takes full advantage of the system memory to accelerate the shuffle process.
+## Build
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/workflow.png" width="50%"/></p>
-<p align="center">Figure 1:  Workflow Comparison between Legacy DAG Computing Frameworks and Frameworks with SCache</p>
+### Build SCache
 
-SCache consists of three components: a distributed shuffle data management system, a DAG co-scheduler, and a worker daemon. As a plug-in system, SCache needs to rely on a DAG framework. As shown in Figure 2, SCache employs the legacy master-slaves architecture like GFS for the shuffle data management system. The master node of SCache coordinates the shuffle blocks globally with ap- plication context. The worker node reserves memory to store blocks. The coordination provides two guarantees: (a) data is stored in memory before tasks start and (b) data is scheduled on-off memory with all-or-nothing and context- aware constraints. The daemon bridges the communication between DAG framework and SCache. The co-scheduler is dedicated to pre-schedule reduce tasks with DAG information and enforce the scheduling results to original scheduler in framework.
+```bash
+cd ${HOME}/SCache
+sbt publishM2   # publishes org.scache to ~/.m2 (needed by spark and hadoop)
+sbt assembly    # fat jar for deployment
+```
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/architecture.png" width="50%"/></p>
-<p align="center">Figure 2: SCache Architecture</p>
+Artifacts:
 
-## Performance
+- `target/scala-2.13/scache_2.13-0.1.0-SNAPSHOT.jar`
+- `target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar`
 
-### Hadoop MapReduce with SCache
+### Build Hadoop
 
-- Hadoop MapReduce with SCache starts pre-fetching in the map phase. This avoids the reduce phase waiting for the shuffle data. Furthermore, pre-fetching utilizes the idle I/O throughput in the map phase. As shown in Figure 3, after better fine-grained utilization of hardware resources, Hadoop MapReduce with SCache optimizes Terasort overall completion time by up to 15% and an average of 13% with input data sizes from 128GB to 512GB.
+```bash
+cd ${HOME}/hadoop
+mvn -DskipTests -Pdist -Dtar package
+# For faster build
+mvn package -T 1C -Pdist -DskipTests -Dtar -Dmaven.javadoc.skip=true -Denforcer.skip=true
+```
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/hadoop.png" width="50%"/></p>
-<p align="center">Figure 3: Hadoop MapReduce Terasort completion time</p>
+### Build Spark 3.5
 
-### Spark with SCache
+```bash
+cd $HOME/spark-3.5
+# Verified 
+./build/sbt -Phadoop-3 -Pscala-2.13 package
+# Not verified yet
+./dev/make-distribution.sh -DskipTests
+```
 
-We reveal the performance of SCache with comprehensive workloads and benchmarks.
-1. Firstly, we run a job with single shuffle to analyze hardware utilization and see the impacts of different components from the scope of a task to a job. The performance evaluation in Figure 5 shows the consistent results with our observation of hardware utilization. For each stage, we pick the task that has median completion time.
+## Deploy / Run
 
-    In the map task, the disk operations are replaced by the memory copies to decouple the shuffle write. It helps eliminate 40% of shuffle write time (Figure 5a), which leads to a 10% improvement of map stage completion time in Figure 4a.
+### Start SCache
 
-    In the reduce task, most of the shuffle overhead is introduced by network transfer delay. By doing shuffle data pre-fetching based on the pre-scheduling results, the explicit network transfer is perfectly overlapped in the map stage. As a result, the combination of these optimizations decreases 100% overhead of the shuffle read in a reduce task (Figure 5b). In addition, the heuristic algorithm can achieve a balanced pre-scheduling result, thus providing 80% improvement in reduce stage completion time (Figure 4b).
+1. Configure cluster hosts in `conf/slaves` and settings in `conf/scache.conf`.
+2. Distribute SCache to the cluster and start it:
 
-    In overall, SCache can help Spark decrease by 89% overhead of the whole shuffle process.
+```bash
+cd $HOME/SCache
+sbin/copy-dir.sh
+sbin/start-scache.sh
+```
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/perf1.png" width="85%"/></p>
-<p align="center">Figure 4 & 5: Stage Completion Time and Median Task Completion Time of Single Shuffle Test</p>
+Stop:
 
-2. Secondly, we use a recognized shuffle intensive benchmark — Terasort to evaluate SCache with different data partition schemes.
+```bash
+cd $HOME/SCache
+sbin/stop-scache.sh
+```
 
-    Terasort consists of two consecutive shuffles. The first shuffle reads the input data and uses a hash partition function for re-partitioning. As shown in Figure 6a, Spark with SCache runs 2 × faster during the reduce stage of the first shuffle. It further proves the effectiveness of SCache’s optimization.
+### Enable in Hadoop MapReduce
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/terasort.png" width="40%"/></p>
-<p align="center">Figure 6: Terasort Evaluation</p>
+- Put `target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar` on the YARN classpath (for example, copy it to `$HADOOP_HOME/share/hadoop/yarn/lib/` on every node).
+- Set the following in `$HADOOP_HOME/etc/hadoop/mapred-site.xml`:
 
-3. At last, in order to prove the performance gain of SCache with a real production workload, we evaluate Spark [TPC-DS](https://github.com/databricks/spark-sql-perf) and present the overall performance improvement.
+```
+mapreduce.job.map.output.collector.class=org.apache.hadoop.mapred.MapTask$ScacheOutputBuffer
+mapreduce.job.reduce.shuffle.consumer.plugin.class=org.apache.hadoop.mapreduce.task.reduce.ScacheShuffle
+mapreduce.scache.home=$HOME/SCache
+```
 
-    TPC-DS benchmark is designed for modeling multiple users sub- mitting varied queries. TPC-DS contains 99 queries and is considered as the standardized industry benchmark for testing big data systems. As shown in Figure 7, the horizontal axis is query name and the vertical axis is query completion time. The overall reduction portion of query time that SCache achieved is 40% on average. Since this evaluation presents the overall job completion time of queries, we believe that our shuffle optimization is promising.
+### Enable in Spark
 
-<p align="center"><img src="https://github.com/wuchunghsuan/SCache/blob/master/fig/tpc-ds.png" width="85%"/></p>
-<p align="center">Figure 7: TPC-DS Benchmark Evaluation</p>
+- Make the SCache jar visible to drivers/executors (either copy to `$SPARK_HOME/jars/` or set `spark.scache.jars`).
+- Set (for example in `$SPARK_HOME/conf/spark-defaults.conf`):
 
-## How to Use SCache
+```
+spark.scache.enable true
+spark.scache.home $HOME/SCache
+spark.scache.jars $HOME/SCache/target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.jar
+spark.shuffle.useOldFetchProtocol true
+```
 
-1. Use sbt to publish SCache jar in local maven repository:
+### Workloads / benchmarks
 
-    `sbt publishM2`
-
-2. Use sbt to create fat jar of SCache:
-
-    `sbt assembly`
-
-3. Configure IP address of slaves in:
-
-    `conf/slaves`
-
-4. Distribute the code of SCache worker to cluster:
-
-    `sbin/copy-dir.sh`
-
-5. Build adapted Hadoop from [here](https://github.com/frankfzw/hadoop/tree/scache) or adapted Spark from [here](https://github.com/frankfzw/spark-scache/tree/scache).
-
-6. Edit `etc/hadoop/mapred-site.xml`:
-
-    - Set `mapreduce.job.map.output.collector.class` to `org.apache.hadoop.mapred.MapTask$ScacheOutputBuffer`
-    - Set `mapreduce.job.reduce.shuffle.consumer.plugin.class` to `org.apache.hadoop.mapreduce.task.reduce.ScacheShuffle`
-    - Set `mapreduce.scache.home` to `your/scache/home`
-
-6. Copy `config-1.2.1.jar`, `scache_2.11-0.1-SNAPSHOT.jar` and `scala-library.jar` to `hadoop-home/share/hadoop/yarn/lib`. You can find these jars in local maven/ivy repository and local scala home.
-
-7. Distribute hadoop code in cluster.
-
-8. Start SCache:
-
-    `sbin/start-scache.sh` 
-
-9. Start Hadoop and submit your jobs.
+- Standalone Spark scripts and HiBench in `$HOME/spark-apps/` (see `$HOME/spark-apps/README.md`).
