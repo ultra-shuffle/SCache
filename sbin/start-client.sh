@@ -3,7 +3,23 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: start-client"
+    cat <<'EOF'
+Usage:
+  start-client.sh [script-options] [--] [ScacheClient options]
+
+Script options:
+  --cpu-node N         Bind client CPU to NUMA node N (uses numactl)
+  --mem-node N         Bind client memory allocations to NUMA node N (uses numactl)
+  --numa-node N        Alias for --mem-node
+  --numactl-opts OPTS  Raw opts passed to numactl (overrides --cpu-node/--mem-node)
+
+Env (alternatives to script options):
+  SCACHE_CLIENT_CPU_NODE
+  SCACHE_CLIENT_MEM_NODE (or SCACHE_CLIENT_NUMA_NODE)
+  SCACHE_CLIENT_NUMACTL_OPTS
+
+Any remaining arguments are forwarded to org.scache.deploy.ScacheClient (e.g. --ip/--port/--master).
+EOF
     exit 1
 }
 
@@ -60,6 +76,72 @@ fi
 JAR="$(find_assembly_jar)"
 
 echo "Starting ScacheClient using $JAR"
-nohup java $SCACHE_JAVA_OPTS -cp "$JAR" "$MAIN_CLASS" >>"$LOG_FILE" 2>&1 &
+
+# Optional: prefix the client JVM with numactl to control NUMA placement.
+# Example (Spark pinned to CPU node 0, memory pool on node 1):
+#   ./sbin/start-client.sh --cpu-node 0 --mem-node 1
+CLIENT_ARGS=()
+CPU_NODE="${SCACHE_CLIENT_CPU_NODE:-}"
+MEM_NODE="${SCACHE_CLIENT_MEM_NODE:-${SCACHE_CLIENT_NUMA_NODE:-}}"
+NUMACTL_OPTS="${SCACHE_CLIENT_NUMACTL_OPTS:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            ;;
+        --cpu-node)
+            [[ $# -ge 2 ]] || usage
+            CPU_NODE="$2"
+            shift 2
+            ;;
+        --mem-node|--numa-node)
+            [[ $# -ge 2 ]] || usage
+            MEM_NODE="$2"
+            shift 2
+            ;;
+        --numactl-opts)
+            [[ $# -ge 2 ]] || usage
+            NUMACTL_OPTS="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            CLIENT_ARGS+=("$@")
+            break
+            ;;
+        *)
+            CLIENT_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+CMD_PREFIX=()
+if [[ -n "${NUMACTL_OPTS}" ]]; then
+    command -v numactl >/dev/null 2>&1 || {
+        echo "ERROR: numactl is required for --numactl-opts/SCACHE_CLIENT_NUMACTL_OPTS" >&2
+        exit 1
+    }
+    # shellcheck disable=SC2206
+    CMD_PREFIX=(numactl ${NUMACTL_OPTS})
+else
+    NUMA_ARGS=()
+    if [[ -n "${CPU_NODE}" ]]; then
+        NUMA_ARGS+=(--cpunodebind="${CPU_NODE}")
+    fi
+    if [[ -n "${MEM_NODE}" ]]; then
+        NUMA_ARGS+=(--membind="${MEM_NODE}")
+    fi
+    if [[ ${#NUMA_ARGS[@]} -gt 0 ]]; then
+        command -v numactl >/dev/null 2>&1 || {
+            echo "ERROR: numactl is required for --cpu-node/--mem-node" >&2
+            exit 1
+        }
+        CMD_PREFIX=(numactl "${NUMA_ARGS[@]}")
+    fi
+fi
+
+nohup "${CMD_PREFIX[@]}" java $SCACHE_JAVA_OPTS -cp "$JAR" "$MAIN_CLASS" "${CLIENT_ARGS[@]}" >>"$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 echo "ScacheClient started (pid=$(cat "$PID_FILE"))"
