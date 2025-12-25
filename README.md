@@ -90,6 +90,22 @@ spark.scache.jars $HOME/SCache/target/scala-2.13/SCache-assembly-0.1.0-SNAPSHOT.
 spark.shuffle.useOldFetchProtocol true
 ```
 
+## IPC Pool Backend (mmap)
+
+SCache can exchange shuffle block bytes between Spark's in-process daemon and the node-local
+`ScacheClient` via a single shared `mmap` pool file (offset/len). This is configured via
+`scache.daemon.ipc.backend=pool` in `conf/scache.conf` and a pool path such as a DAX-mounted file.
+
+### Self-test (no RPC)
+
+This quick check verifies that two independent `mmap`s of the same pool file observe each other's
+writes correctly (i.e., the basic shared-memory mechanism works):
+
+```bash
+cd $HOME/SCache
+sbt "runMain org.scache.deploy.PoolIpcSelfTest --path /dev/shm/scache-ipc.pool --size 1g --chunk 256m"
+```
+
 ### Workloads / benchmarks
 
 - Standalone Spark scripts and HiBench in `$HOME/spark-apps/` (see `$HOME/spark-apps/README.md`).

@@ -38,6 +38,123 @@ class ScacheClient(
   conf: ScacheConf) extends ThreadSafeRpcEndpoint with Logging {
    conf.set("scache.client.port", rpcEnv.address.port.toString)
 
+  private val ipcBackend = conf.getString("scache.daemon.ipc.backend", "files").trim.toLowerCase
+  private val ipcMode = conf.getString("scache.daemon.ipc.mode", "remote").trim.toLowerCase
+  private val ipcDirRemote = conf.getString(
+    "scache.daemon.ipc.dir.remote",
+    conf.getString("scache.daemon.ipc.dir", ScacheConf.scacheLocalDir))
+  private val ipcDirLocal = conf.getString("scache.daemon.ipc.dir.local", ipcDirRemote)
+  private val ipcDirGet = conf.getString("scache.daemon.ipc.dir.get", ipcDirLocal)
+  private val ipcPretouch = conf.getBoolean("scache.daemon.ipc.pretouch", false)
+  private val ipcPretouchPageSize = conf.getInt("scache.daemon.ipc.pretouch.pageSize", 4096)
+
+  private val ipcPoolPathDefault =
+    new File(ScacheConf.scacheLocalDir, "scache-ipc.pool").getAbsolutePath
+  private val ipcPoolPath = conf.getString("scache.daemon.ipc.pool.path", ipcPoolPathDefault)
+  private val ipcPoolSizeBytes = conf.getSizeAsBytes("scache.daemon.ipc.pool.size", "1024m")
+  private val ipcPoolMapChunkBytes = {
+    val bytes = conf.getSizeAsBytes("scache.daemon.ipc.pool.mapChunk", "256m")
+    Math.min(bytes, Int.MaxValue.toLong).toInt
+  }
+  private val ipcPoolAlignBytes = conf.getInt("scache.daemon.ipc.pool.align", 4096)
+
+  @volatile private var poolAllocator: PoolAllocator = null
+  @volatile private var poolFile: MmapPoolFile = null
+
+  private def getOrCreatePool(path: String): (MmapPoolFile, PoolAllocator) = {
+    val currentFile = poolFile
+    val currentAllocator = poolAllocator
+    if (currentFile != null && currentAllocator != null && currentFile.path == path) {
+      return (currentFile, currentAllocator)
+    }
+    synchronized {
+      val againFile = poolFile
+      val againAllocator = poolAllocator
+      if (againFile != null && againAllocator != null && againFile.path == path) {
+        return (againFile, againAllocator)
+      }
+
+      val created = MmapPoolFile.createOrOpen(
+        path,
+        desiredSizeBytes = ipcPoolSizeBytes,
+        mapChunkBytes = ipcPoolMapChunkBytes)
+      val allocator = new PoolAllocator(
+        poolSizeBytes = created.sizeBytes,
+        chunkSizeBytes = ipcPoolMapChunkBytes.toLong,
+        alignBytes = ipcPoolAlignBytes)
+      poolFile = created
+      poolAllocator = allocator
+      (created, allocator)
+    }
+  }
+
+  private def parseStorageLevel(key: String, defaultValue: StorageLevel): StorageLevel = {
+    val levelName = conf.getString(key, "").trim
+    if (levelName.isEmpty) return defaultValue
+    val upper = levelName.toUpperCase
+    try {
+      StorageLevel.fromString(upper)
+    } catch {
+      case _: IllegalArgumentException =>
+        logWarning(s"Invalid $key=$upper; falling back to $defaultValue")
+        defaultValue
+    }
+  }
+
+  private val daemonPutStorageLevelDefault =
+    parseStorageLevel("scache.daemon.putBlock.storageLevel", StorageLevel.MEMORY_ONLY)
+  private val daemonPutStorageLevelLocal =
+    parseStorageLevel("scache.daemon.putBlock.storageLevel.local", daemonPutStorageLevelDefault)
+  private val daemonPutStorageLevelRemote =
+    parseStorageLevel("scache.daemon.putBlock.storageLevel.remote", daemonPutStorageLevelDefault)
+
+  private def mkdirsOrWarn(path: String): File = {
+    val dir = new File(path)
+    if (!dir.exists() && !dir.mkdirs()) {
+      logWarning(s"Failed to create daemon IPC directory: $path")
+    }
+    dir
+  }
+
+  private val ipcDirRemoteFile = mkdirsOrWarn(ipcDirRemote)
+  private val ipcDirLocalFile = mkdirsOrWarn(ipcDirLocal)
+  private val ipcDirGetFile = mkdirsOrWarn(ipcDirGet)
+
+  private def putIpcFileIn(dir: File, blockName: String): File = new File(dir, blockName)
+  private def getIpcFile(blockName: String): File = new File(ipcDirGetFile, blockName)
+
+  private def isLocalConsumer(blockId: BlockId): Boolean = blockId match {
+    case bId: ScacheBlockId =>
+      val shuffleKey = ShuffleKey(bId.app, bId.jobId, bId.shuffleId)
+      val status = mapOutputTracker.getShuffleStatuses(shuffleKey)
+      if (status == null) {
+        false
+      } else if (bId.reduceId < 0 || bId.reduceId >= status.reduceArray.length) {
+        false
+      } else {
+        status.reduceArray(bId.reduceId).host == hostname
+      }
+    case _ =>
+      false
+  }
+
+  private def putIpcFileCandidates(blockId: BlockId): Seq[File] = {
+    val name = blockId.toString
+    val localFile = putIpcFileIn(ipcDirLocalFile, name)
+    val remoteFile = putIpcFileIn(ipcDirRemoteFile, name)
+
+    val preferLocal = ipcMode match {
+      case "local" => true
+      case "remote" => false
+      case "auto" => isLocalConsumer(blockId)
+      case other =>
+        logWarning(s"Unknown scache.daemon.ipc.mode=$other; defaulting to remote")
+        false
+    }
+
+    if (preferLocal) Seq(localFile, remoteFile) else Seq(remoteFile, localFile)
+  }
+
   val numUsableCores = conf.getInt("scache.cores", 1)
   val serializer = new JavaSerializer(conf)
   val serializerManager = new SerializerManager(serializer, conf)
@@ -99,9 +216,13 @@ class ScacheClient(
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-    case PutBlock(blockId, size) =>
+    case PreparePutBlock(blockId, size) =>
+      doAsync[IpcLocation](s"Prepare IPC location for $blockId from daemon", context) {
+        preparePutBlockFromDaemon(blockId, size)
+      }
+    case PutBlock(blockId, size, ipc) =>
       doAsync[Boolean](s"Read block $blockId from daemon", context) {
-        readBlockFromDaemon(context, blockId, size)
+        readBlockFromDaemon(context, blockId, size, ipc)
       }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
@@ -158,28 +279,48 @@ class ScacheClient(
   //   blockManager.asyncGetRemoteBlock(blockManagerId, bIds.toArray)
   // }
 
-  def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int): Boolean= {
+  def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int, ipc: IpcLocation): Boolean= {
+    val storageLevel =
+      if (isLocalConsumer(blockId)) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
+
     if (size == 0) {
-      val data = new Array[Byte](0)
-      val buf = ByteBuffer.wrap(data)
-      val chunkedBuffer = new ChunkedByteBuffer(Array(buf))
-      blockManager.putBytes(blockId, chunkedBuffer, StorageLevel.OFF_HEAP)
+      val chunkedBuffer = new ChunkedByteBuffer(Array(ByteBuffer.allocate(0)))
+      blockManager.putBytes(blockId, chunkedBuffer, storageLevel)
       return true
     }
     try {
-        val f = new File(s"${ScacheConf.scacheLocalDir}/${blockId.toString}")
-        val channel = FileChannel.open(f.toPath,
-          StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.DELETE_ON_CLOSE)
-        val buffer = channel.map(MapMode.READ_WRITE, 0, size)
-        // close the channel and delete the tmp file
-        val data = new Array[Byte](size)
-        buffer.get(data)
+        val data: Array[Byte] = ipc match {
+          case IpcPoolSlice(poolPath, offset, _) =>
+            val (pool, allocator) = getOrCreatePool(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
+            try {
+              val buffer = pool.slice(offset, size)
+              val array = new Array[Byte](size)
+              buffer.get(array)
+              array
+            } finally {
+              allocator.free(offset, size)
+            }
+
+          case IpcFile(path) =>
+            val channel = FileChannel.open(
+              new File(path).toPath,
+              StandardOpenOption.READ,
+              StandardOpenOption.DELETE_ON_CLOSE)
+            try {
+              val buffer = channel.map(MapMode.READ_ONLY, 0, size)
+              val array = new Array[Byte](size)
+              buffer.get(array)
+              array
+            } finally {
+              channel.close()
+            }
+        }
+
         logDebug(s"Get block ${blockId} with $size, hash code: ${data.toSeq.hashCode()}")
         val buf = ByteBuffer.wrap(data)
         val chunkedBuffer = new ChunkedByteBuffer(Array(buf))
-        blockManager.putBytes(blockId, chunkedBuffer, StorageLevel.MEMORY_ONLY)
-        logDebug(s"Put block $blockId with size $size successfully")
-        channel.close()
+        blockManager.putBytes(blockId, chunkedBuffer, storageLevel)
+        logDebug(s"Put block $blockId with size $size successfully (level=$storageLevel)")
         true
 
         // start block transmission immediately
@@ -191,6 +332,54 @@ class ScacheClient(
           logError(s"Copy block $blockId error, ${e.getMessage}")
           false
       }
+  }
+
+  private def preparePutBlockFromDaemon(blockId: BlockId, size: Int): IpcLocation = {
+    if (size < 0) return IpcFile("")
+
+    if (ipcBackend == "pool") {
+      if (size == 0) return IpcPoolSlice(ipcPoolPath, 0L, 0)
+      val (_, allocator) = getOrCreatePool(ipcPoolPath)
+      allocator.allocate(size) match {
+        case Some(offset) =>
+          return IpcPoolSlice(ipcPoolPath, offset, size)
+        case None =>
+          logWarning(s"IPC pool is full; falling back to file IPC for block $blockId (size=$size)")
+      }
+    }
+
+    val f = putIpcFileCandidates(blockId).head
+    try {
+      val channel = FileChannel.open(
+        f.toPath,
+        StandardOpenOption.READ,
+        StandardOpenOption.WRITE,
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING)
+      try {
+        if (size == 0) {
+          channel.truncate(0)
+          return IpcFile(f.getAbsolutePath)
+        }
+        val buffer = channel.map(MapMode.READ_WRITE, 0, size.toLong)
+        val doPretouch = ipcPretouch && f.getParentFile.getAbsolutePath == ipcDirLocalFile.getAbsolutePath
+        if (doPretouch) {
+          val step = Math.max(ipcPretouchPageSize, 1)
+          var i = 0
+          while (i < size) {
+            buffer.put(i, 0.toByte)
+            i += step
+          }
+        }
+        IpcFile(f.getAbsolutePath)
+      } finally {
+        channel.close()
+      }
+    } catch {
+      case e: Exception =>
+        logWarning(s"Failed to prepare IPC file for block $blockId", e)
+        IpcFile("")
+    }
   }
 
   def sendBlockToDaemon(context: RpcCallContext, blockId: BlockId): Int= {
@@ -206,11 +395,24 @@ class ScacheClient(
           assert(chunks.size == 1)
           val bytes = new Array[Byte](chunks(0).remaining())
           chunks(0).get(bytes)
-          val f = new File(s"${ScacheConf.scacheLocalDir}/${blockId.toString}")
-          val channel = FileChannel.open(f.toPath, StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE)
-          val writeBuf = channel.map(MapMode.READ_WRITE, 0, bytes.length)
-          writeBuf.put(bytes, 0, bytes.length)
-          return bytes.length
+          val f = getIpcFile(blockId.toString)
+          val channel = FileChannel.open(
+            f.toPath,
+            StandardOpenOption.READ,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING)
+          try {
+            if (bytes.isEmpty) {
+              channel.truncate(0)
+              return 0
+            }
+            val writeBuf = channel.map(MapMode.READ_WRITE, 0, bytes.length)
+            writeBuf.put(bytes, 0, bytes.length)
+            return bytes.length
+          } finally {
+            channel.close()
+          }
         case _ =>
           Thread.sleep(sleepMS)
           times += 1

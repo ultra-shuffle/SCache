@@ -4,6 +4,8 @@ import java.io.{ByteArrayOutputStream, File, ObjectOutputStream}
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.channels.FileChannel.MapMode
+import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
 
 import org.scache.deploy.DeployMessages._
@@ -38,10 +40,57 @@ class Daemon(
   private val rpcEnv = RpcEnv.create("scache.daemon", host, daemonPort, conf, true)
   private val clientRef = rpcEnv.setupEndpointRef(RpcAddress(host, clientPort), "ScacheClient")
 
+  private val ipcBackend = conf.getString("scache.daemon.ipc.backend", "files").trim.toLowerCase
+  private val ipcMode = conf.getString("scache.daemon.ipc.mode", "remote").trim.toLowerCase
+  private val ipcDirRemote = conf.getString(
+    "scache.daemon.ipc.dir.remote",
+    conf.getString("scache.daemon.ipc.dir", ScacheConf.scacheLocalDir))
+  private val ipcDirGet = conf.getString(
+    "scache.daemon.ipc.dir.get",
+    conf.getString("scache.daemon.ipc.dir.local", ipcDirRemote))
+  private val ipcPrepare = conf.getBoolean(
+    "scache.daemon.ipc.prepare",
+    ipcBackend == "pool" || ipcMode != "remote")
+
+  private val ipcPoolPath = conf.getString(
+    "scache.daemon.ipc.pool.path",
+    new File(ScacheConf.scacheLocalDir, "scache-ipc.pool").getAbsolutePath)
+  private val ipcPoolMapChunkBytes = {
+    val bytes = conf.getSizeAsBytes("scache.daemon.ipc.pool.mapChunk", "256m")
+    Math.min(bytes, Int.MaxValue.toLong).toInt
+  }
+
+  @volatile private var poolWriter: MmapPoolFile = null
+  private val ipcDirRemoteFile = mkdirsOrWarn(ipcDirRemote)
+  private val ipcDirGetFile = mkdirsOrWarn(ipcDirGet)
+
   // start daemon rpc thread
   doAsync[Unit]("Start Scache Daemon") {
     logInfo("Start deamon")
     rpcEnv.awaitTermination()
+  }
+
+  private def mkdirsOrWarn(path: String): File = {
+    val dir = new File(path)
+    if (!dir.exists() && !dir.mkdirs()) {
+      logWarning(s"Failed to create daemon IPC directory: $path")
+    }
+    dir
+  }
+
+  private def putIpcFallbackFile(blockName: String): File = new File(ipcDirRemoteFile, blockName)
+  private def getIpcFile(blockName: String): File = new File(ipcDirGetFile, blockName)
+
+  private def getOrCreatePoolWriter(poolPath: String): MmapPoolFile = {
+    val current = poolWriter
+    if (current != null && current.path == poolPath) return current
+    synchronized {
+      val again = poolWriter
+      if (again != null && again.path == poolPath) return again
+      val created = MmapPoolFile.open(poolPath, mapChunkBytes = ipcPoolMapChunkBytes)
+      poolWriter = created
+      created
+    }
   }
 
   def putBlock(blockId: String, data: Array[Byte], rawLen: Int, compressedLen: Int): Unit = {
@@ -51,12 +100,50 @@ class Daemon(
     }
     logDebug(s"Start copying block $blockId with size $rawLen")
     doAsync[Unit](s"Copy block $blockId") {
-      val f = new File(s"${ScacheConf.scacheLocalDir}/$blockId")
-      val channel = FileChannel.open(f.toPath, StandardOpenOption.READ,
-        StandardOpenOption.WRITE, StandardOpenOption.CREATE)
-      val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, data.length)
-      buf.put(data)
-      val res = clientRef.askWithRetry[Boolean](PutBlock(scacheBlockId, data.length))
+      val preparedIpc: Option[IpcLocation] = if (ipcPrepare) {
+        try {
+          Some(clientRef.askWithRetry[IpcLocation](PreparePutBlock(scacheBlockId, data.length)))
+        } catch {
+          case e: Exception =>
+            logWarning(s"PreparePutBlock failed for $blockId; falling back to direct file write", e)
+            None
+        }
+      } else None
+
+      val preparedValid = preparedIpc.filter {
+        case IpcFile(path) => path != null && path.trim.nonEmpty
+        case IpcPoolSlice(_, offset, length) => offset >= 0 && length >= 0
+      }
+
+      val (ipc, prepared) = preparedValid match {
+        case Some(loc) => (loc, true)
+        case None => (IpcFile(putIpcFallbackFile(blockId).getAbsolutePath), false)
+      }
+
+      ipc match {
+        case IpcPoolSlice(poolPath, offset, length) =>
+          val writer = getOrCreatePoolWriter(if (poolPath.nonEmpty) poolPath else ipcPoolPath)
+          writer.write(offset, data, length)
+
+        case IpcFile(path) =>
+          val f = new File(path)
+          val channelOptions =
+            if (prepared) {
+              Array(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE)
+            } else {
+              Array(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+            }
+
+          val channel = FileChannel.open(f.toPath, channelOptions: _*)
+          try {
+            val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, data.length)
+            buf.put(data)
+          } finally {
+            channel.close()
+          }
+      }
+
+      val res = clientRef.askWithRetry[Boolean](PutBlock(scacheBlockId, data.length, ipc))
       if (res) {
         logDebug(s"Copy block $blockId succeeded")
       } else {
@@ -74,13 +161,25 @@ class Daemon(
     if (size < 0) {
       return None
     }
-    val f = new File(s"${ScacheConf.scacheLocalDir}/$blockId")
-    val channel = FileChannel.open(f.toPath, StandardOpenOption.READ,
-      StandardOpenOption.WRITE, StandardOpenOption.CREATE)
-    val buf = channel.map(FileChannel.MapMode.READ_WRITE, 0, size)
-    val arrayBuf = new Array[Byte](size)
-    buf.get(arrayBuf)
-    Some(arrayBuf)
+    if (size == 0) {
+      return Some(new Array[Byte](0))
+    }
+    val f = getIpcFile(blockId)
+    try {
+      val channel = FileChannel.open(f.toPath, StandardOpenOption.READ, StandardOpenOption.DELETE_ON_CLOSE)
+      try {
+        val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, size)
+        val arrayBuf = new Array[Byte](size)
+        buf.get(arrayBuf)
+        Some(arrayBuf)
+      } finally {
+        channel.close()
+      }
+    } catch {
+      case e: Exception =>
+        logWarning(s"Failed to read block $blockId from IPC file", e)
+        None
+    }
   }
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
     doAsync[Unit] ("Register Shuffles") {

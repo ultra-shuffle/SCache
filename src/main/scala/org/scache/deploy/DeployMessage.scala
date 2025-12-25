@@ -11,6 +11,10 @@ private[deploy] trait DeployMessage extends Serializable
 
 private[deploy] object DeployMessages {
 
+  sealed trait IpcLocation extends Serializable
+  case class IpcFile(path: String) extends IpcLocation
+  case class IpcPoolSlice(poolPath: String, offset: Long, length: Int) extends IpcLocation
+
   sealed trait ToDeployMaster
   case class Heartbeat(id: String, worker: RpcEndpointRef) extends ToDeployMaster
   case class RegisterClient(hostname: String, port: Int, worker: RpcEndpointRef) extends ToDeployMaster
@@ -20,7 +24,8 @@ private[deploy] object DeployMessages {
   case class MapEndToMaster(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends ToDeployMaster
 
   sealed trait FromDaemon
-  case class PutBlock(scacheBlockId: BlockId, size: Int) extends FromDaemon
+  case class PreparePutBlock(scacheBlockId: BlockId, size: Int) extends FromDaemon
+  case class PutBlock(scacheBlockId: BlockId, size: Int, ipc: IpcLocation) extends FromDaemon
   case class GetBlock(scacheBlockId: BlockId) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   case class MapEnd(appName: String, jobId: Int, shuffleId: Int, mapId: Int) extends FromDaemon
