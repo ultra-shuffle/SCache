@@ -8,10 +8,10 @@ The previous (upstream-style) README is archived as `README.old.md`.
 
 SCache now depends on these repositories being present at the following paths:
 
-- `${HOME}/hadoop/`
-- `${HOME}/spark-3.5/`
-- `${HOME}/spark-apps/`
-- `${HOME}/spark-apps/HiBench-7.1.1/`
+- `${HOME}/hadoop/`: [Hadoop](https://github.com/XingZYu/hadoop)
+- `${HOME}/spark-3.5/`: [Spark](https://github.com/XingZYu/spark-3.5-scache)
+- `${HOME}/spark-apps/`: [Spark Apps](https://github.com/XingZYu/spark-apps)
+- `${HOME}/spark-apps/HiBench-7.1.1/`: [HiBench Suite](https://github.com/XingZYu/hibench)
 
 ## Build
 
