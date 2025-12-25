@@ -108,7 +108,8 @@ class Daemon(
   }
 
   def stop(): Unit = {
-    asyncThreadPool.shutdownNow()
+    rpcEnv.shutdown()
+    asyncThreadPool.shutdown()
   }
 
   private def doAsync[T](actionMessage: String)(body: => T): Unit = {
@@ -121,7 +122,7 @@ class Daemon(
         logDebug("Done " + actionMessage + ", response is " + response)
       case Failure(t) =>
         logError("Error in " + actionMessage, t)
-    }
+    }(ThreadUtils.sameThread)
   }
 }
 
@@ -132,4 +133,3 @@ object Daemon {
     Thread.sleep(10000)
   }
 }
-

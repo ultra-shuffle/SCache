@@ -92,7 +92,10 @@ private[scache] trait Logging {
   private def initializeLogging(): Unit = {
     val scache_home = {
       if (_logDir == null) {
-        sys.env.get("SCACHE_HOME").getOrElse("/home/spark/SCache")
+        Option(System.getProperty("SCACHE_HOME"))
+          .filter(_.nonEmpty)
+          .orElse(sys.env.get("SCACHE_HOME"))
+          .getOrElse("/home/spark/SCache")
       } else {
         _logDir
       }
