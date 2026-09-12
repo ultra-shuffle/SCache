@@ -33,7 +33,7 @@ public final class UrmaNative {
     public static boolean isLoaded() { return loaded; }
 
     // ---- Lifecycle ----
-    static native long nativeInit(String deviceName, int queueDepth, int maxChunkBytes, boolean strict, String wireRole);
+    static native long nativeInit(String deviceName, int queueDepth, int maxChunkBytes, boolean strict);
     static native void nativeConnect(long handle, byte[] eid, int uasid, int jettyId,
                                      int remoteMaxChunkBytes, int segmentUasid,
                                      long segmentGeneration, long segAddr,

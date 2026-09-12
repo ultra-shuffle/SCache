@@ -94,30 +94,25 @@ static jlongArray metrics_array(JNIEnv* env, const TransportMetrics& m) {
 
 extern "C" {
 
-// UrmaNative.nativeInit(String deviceName, int queueDepth, int maxChunkBytes, boolean strict, String wireRole)
+// UrmaNative.nativeInit(String deviceName, int queueDepth, int maxChunkBytes, boolean strict)
 JNIEXPORT jlong JNICALL
 Java_org_scache_network_ub_UrmaNative_nativeInit(
     JNIEnv* env, jclass clazz, jstring deviceName,
-    jint queueDepth, jint maxChunkBytes, jboolean strict, jstring wireRole)
+    jint queueDepth, jint maxChunkBytes, jboolean strict)
 {
     (void)clazz;
     try {
-        if (deviceName == nullptr || wireRole == nullptr || queueDepth <= 0 ||
-            maxChunkBytes <= 0) {
+        if (deviceName == nullptr || queueDepth <= 0 || maxChunkBytes <= 0) {
             throw std::runtime_error("invalid nativeInit arguments");
         }
         const char* dev = env->GetStringUTFChars(deviceName, nullptr);
         if (dev == nullptr) return 0;
-        const char* role = env->GetStringUTFChars(wireRole, nullptr);
-        if (role == nullptr) { env->ReleaseStringUTFChars(deviceName, dev); return 0; }
         TransportOptions opts;
         opts.device_name = dev;
-        opts.wire_role = role ? role : "";
         opts.queue_depth = static_cast<uint32_t>(queueDepth);
         opts.max_chunk_bytes = static_cast<uint32_t>(maxChunkBytes);
         opts.strict_mode = (strict == JNI_TRUE);
         env->ReleaseStringUTFChars(deviceName, dev);
-        env->ReleaseStringUTFChars(wireRole, role);
 
         std::unique_ptr<UrmaTransport> transport(new UrmaTransport());
         transport->init(opts);

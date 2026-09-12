@@ -26,7 +26,7 @@ public final class UrmaTransport implements AutoCloseable {
     /**
      * Create and initialize a URMA transport.
      *
-     * @param deviceName   URMA device name (e.g. "openurma0")
+     * @param deviceName   URMA device name reported by the installed provider
      * @param queueDepth   Completion queue depth
      * @param maxChunkBytes Configured maximum bytes per raw URMA operation. The
      *                      native transport clamps this to the queried provider capability.
@@ -34,18 +34,6 @@ public final class UrmaTransport implements AutoCloseable {
      */
     public static UrmaTransport open(String deviceName, int queueDepth,
                                       int maxChunkBytes, boolean strict)
-            throws UrmaInitializationException {
-        String launcherRole = System.getenv("OPENURMA_WIRE_ROLE");
-        if (launcherRole == null || launcherRole.isBlank()) {
-            throw new UrmaInitializationException(
-                "OPENURMA_WIRE_ROLE must be set by the launcher before JVM startup");
-        }
-        return open(deviceName, queueDepth, maxChunkBytes, strict, launcherRole);
-    }
-
-    public static UrmaTransport open(String deviceName, int queueDepth,
-                                      int maxChunkBytes, boolean strict,
-                                      String wireRole)
             throws UrmaInitializationException {
         UrmaNative.ensureLoaded();
 
@@ -58,23 +46,23 @@ public final class UrmaTransport implements AutoCloseable {
         if (maxChunkBytes <= 0) {
             throw new UrmaInitializationException("maxChunkBytes must be > 0, got " + maxChunkBytes);
         }
-        if (wireRole == null || (!wireRole.equals("listen") && !wireRole.equals("connect"))) {
-            throw new UrmaInitializationException("wireRole must be listen or connect");
-        }
-        String launcherRole = System.getenv("OPENURMA_WIRE_ROLE");
-        if (launcherRole == null || !launcherRole.equals(wireRole)) {
-            throw new UrmaInitializationException(
-                "launcher OPENURMA_WIRE_ROLE does not match expected role " + wireRole);
-        }
-
         UrmaTransport t = new UrmaTransport();
         t.deviceName = deviceName;
         t.ownerEpoch = System.nanoTime();
-        t.nativeHandle = UrmaNative.nativeInit(deviceName, queueDepth, maxChunkBytes, strict, wireRole);
+        t.nativeHandle = UrmaNative.nativeInit(deviceName, queueDepth, maxChunkBytes, strict);
         EndpointDescriptor local = EndpointDescriptor.fromBytes(
             UrmaNative.nativeGetLocalEndpoint(t.nativeHandle));
         t.maxChunkBytes = local.maxChunkBytes;
         return t;
+    }
+
+    /** Compatibility overload for older launchers; role selection is not needed on hardware. */
+    @Deprecated
+    public static UrmaTransport open(String deviceName, int queueDepth,
+                                      int maxChunkBytes, boolean strict,
+                                      String ignoredRole)
+            throws UrmaInitializationException {
+        return open(deviceName, queueDepth, maxChunkBytes, strict);
     }
 
     /** Connect to a remote endpoint. */

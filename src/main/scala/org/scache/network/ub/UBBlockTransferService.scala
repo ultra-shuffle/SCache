@@ -73,8 +73,7 @@ private[scache] class UBBlockTransferService(
     UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
   require(transportBackend == "real",
     s"production SCache supports only scache.ub.transport=real; got $transportBackend")
-  private val wireRole = conf.getString("spark.urma.wireRole", "").trim
-  private val wirePath = conf.getString("spark.urma.wirePath", "").trim
+  private val deviceName = conf.getString("spark.urma.device", "").trim
   private val controlBindHost = conf.getString("spark.urma.controlBindHost", hostName).trim
   private val controlAdvertiseHost = conf.getString("spark.urma.controlAdvertiseHost", hostName).trim
   private val nodeId = conf.getString("spark.urma.nodeId", s"$hostName-${UUID.randomUUID}")
@@ -126,26 +125,13 @@ private[scache] class UBBlockTransferService(
   override def init(blockDataManager: BlockDataManager): Unit = {
     require(controlBindHost.nonEmpty && controlAdvertiseHost.nonEmpty,
       "UB control bind and advertise hosts must be explicit")
-    val device = {
-      require(wireRole == "listen" || wireRole == "connect",
-        "spark.urma.wireRole must be explicitly listen or connect")
-      require(wirePath.nonEmpty, "spark.urma.wirePath must be explicitly configured")
-      val launcherRole = Option(System.getenv("OPENURMA_WIRE_ROLE")).getOrElse("")
-      require(launcherRole == wireRole,
-        s"OPENURMA_WIRE_ROLE=$launcherRole does not match spark.urma.wireRole=$wireRole")
-      val launcherWirePath = Option(System.getenv("OPENURMA_WIRE_PATH")).getOrElse("")
-      require(launcherWirePath == wirePath,
-        s"OPENURMA_WIRE_PATH=$launcherWirePath does not match spark.urma.wirePath=$wirePath")
-      wireRole match {
-        case "listen" => conf.getString("spark.urma.device.listen", "openurma0")
-        case "connect" => conf.getString("spark.urma.device.connect", "openurma1")
-      }
-    }
+    require(deviceName.nonEmpty,
+      "spark.urma.device must name a device reported by the installed URMA provider")
     try {
       dataManager = blockDataManager
-      transport = UbTransportFactory.open(transportBackend, device,
-        conf.getInt("spark.urma.queueDepth", 128), conf.getInt("spark.urma.chunkSize", 4096),
-        strictMode, wireRole)
+      transport = UbTransportFactory.open(transportBackend, deviceName,
+        conf.getInt("spark.urma.queueDepth", 128),
+        conf.getInt("spark.urma.chunkSize", 10 * 1024 * 1024), strictMode)
       require(arenaCount > 0, "spark.urma.arenaCount must be positive")
       if (sharedPoolEnabled) {
         require(sharedPoolDirectory.nonEmpty,
@@ -162,8 +148,8 @@ private[scache] class UBBlockTransferService(
       acceptThread = new Thread(() => acceptLoop(), s"ub-control-$nodeId")
       acceptThread.setDaemon(true)
       acceptThread.start()
-      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch backend=$transportBackend role=$wireRole " +
-        s"device=$device wirePath=$wirePath control=$controlAdvertiseHost:${server.getLocalPort} " +
+      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch backend=$transportBackend " +
+        s"device=$deviceName control=$controlAdvertiseHost:${server.getLocalPort} " +
           s"arenaBytes=${arena.capacity} arenas=${arena.arenaCount}")
     } catch {
       case NonFatal(e) =>

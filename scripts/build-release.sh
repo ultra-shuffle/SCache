@@ -5,13 +5,18 @@ set -euo pipefail
 SCACHE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_ROOT="${SCACHE_RELEASE_BUILD_ROOT:-$(mktemp -d /tmp/scache_release.XXXXXX)}"
 INSTALL_DIR="${SCACHE_RELEASE_INSTALL_DIR:-$SCACHE_ROOT/target/release}"
-JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 SBT_BIN="${SBT_BIN:-sbt}"
 SBT_LAUNCH_JAR="${SBT_LAUNCH_JAR:-}"
 TARGET_DIR="$BUILD_ROOT/target"
 SCALA_DIR="$TARGET_DIR/scala-2.13"
 ASSEMBLY="$SCALA_DIR/SCache-assembly-0.1.0-SNAPSHOT.jar"
 INTEGRATION="$SCALA_DIR/SCache-integration-0.1.0-SNAPSHOT.jar"
+
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  JAVAC="$(command -v javac || true)"
+  [[ -n "$JAVAC" ]] || { echo "set JAVA_HOME or install a JDK" >&2; exit 1; }
+  JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$JAVAC")")")"
+fi
 
 mkdir -p "$BUILD_ROOT" "$INSTALL_DIR"
 cd "$SCACHE_ROOT"

@@ -8,32 +8,23 @@ set(CMAKE_SKIP_BUILD_RPATH TRUE)
 set(CMAKE_SKIP_INSTALL_RPATH TRUE)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH FALSE)
 
-# ---- Paths ----
-set(URMA_ROOT "$ENV{OU_UMDK_BUILD}" CACHE PATH "UMDK build directory")
-if(NOT URMA_ROOT)
-    message(FATAL_ERROR "Set OU_UMDK_BUILD or -DURMA_ROOT to the built UMDK tree")
-endif()
-
-# The openurma_vdev provider exposes the registered-MR token/generation through
-# its optional q5-compatible diagnostic ABI. The transport source deliberately
-# uses __has_include so it can still build against a generic UMDK, but a native
-# vdev build must add the provider header directory explicitly. Keep this
-# optional: official UMDK builds that do not ship the project provider must not
-# fail merely because the diagnostic ABI is unavailable.
-set(OPENURMA_VDEV_INCLUDE "$ENV{OPENURMA_VDEV_INCLUDE}" CACHE PATH
-    "openurma_vdev provider headers (optional)")
-
-set(URMA_VENDOR "${URMA_ROOT}/../../vendor/umdk/src/urma")
-find_path(URMA_INC urma_api.h
-    HINTS "$ENV{OU_UMDK_INCLUDE}" "${URMA_VENDOR}/lib/urma/core/include"
-    REQUIRED NO_DEFAULT_PATH)
-find_path(URMA_COMMON_INC ub_util.h
-    HINTS "$ENV{OU_UMDK_COMMON_INCLUDE}" "${URMA_VENDOR}/common/include"
-    REQUIRED NO_DEFAULT_PATH)
-find_library(URMA_LIBRARY NAMES urma
-    HINTS "${URMA_ROOT}/urma/lib/urma/core" REQUIRED NO_DEFAULT_PATH)
-find_library(URMA_COMMON_LIBRARY NAMES urma_common
-    HINTS "${URMA_ROOT}/urma/common" REQUIRED NO_DEFAULT_PATH)
+# ---- Official UMDK ----
+# The normal deployment installs the vendor-supported UMDK development package,
+# which provides /usr/include/ub/umdk/urma and liburma.so. UMDK_ROOT is only an
+# optional prefix override for non-system SDK installations; no source/build
+# tree layout is assumed.
+set(UMDK_ROOT "" CACHE PATH "Optional UMDK installation prefix")
+find_path(URMA_INC
+    NAMES urma_api.h
+    HINTS "${UMDK_ROOT}/include/ub/umdk/urma"
+    PATH_SUFFIXES ub/umdk/urma
+    REQUIRED)
+find_library(URMA_LIBRARY
+    NAMES urma
+    HINTS "${UMDK_ROOT}/lib64" "${UMDK_ROOT}/lib"
+    REQUIRED)
+message(STATUS "UMDK URMA headers: ${URMA_INC}")
+message(STATUS "UMDK URMA library: ${URMA_LIBRARY}")
 
 # ---- JNI headers (the library does not link libjvm/AWT) ----
 set(JAVA_HOME "$ENV{JAVA_HOME}" CACHE PATH "JDK root")
@@ -63,15 +54,8 @@ add_library(spark_urma_obj OBJECT ${SOURCES})
 target_include_directories(spark_urma_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${URMA_INC}
-    ${URMA_COMMON_INC}
     ${JNI_INCLUDE_DIRS}
 )
-if(OPENURMA_VDEV_INCLUDE AND EXISTS "${OPENURMA_VDEV_INCLUDE}/openurma_vdev_q5.h")
-    target_include_directories(spark_urma_obj PRIVATE ${OPENURMA_VDEV_INCLUDE})
-    message(STATUS "openurma_vdev MR ABI enabled from ${OPENURMA_VDEV_INCLUDE}")
-else()
-    message(STATUS "openurma_vdev MR ABI disabled (provider header not found)")
-endif()
 target_compile_features(spark_urma_obj PUBLIC cxx_std_17)
 target_compile_options(spark_urma_obj PRIVATE -Wall -Wextra -Werror)
 set_target_properties(spark_urma_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -80,7 +64,7 @@ option(BUILD_STANDALONE "Build standalone C++ transport library" OFF)
 if(BUILD_STANDALONE)
     add_library(spark_urma SHARED $<TARGET_OBJECTS:spark_urma_obj>)
     target_link_libraries(spark_urma PRIVATE
-        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread ${CMAKE_DL_LIBS})
+        ${URMA_LIBRARY} pthread)
 endif()
 
 # JNI shared library (libSparkUrma.so)
@@ -89,14 +73,11 @@ add_library(SparkUrma SHARED
     src/spark_urma_jni.cpp
 )
 target_include_directories(SparkUrma PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${URMA_COMMON_INC} ${JNI_INCLUDE_DIRS})
-if(OPENURMA_VDEV_INCLUDE AND EXISTS "${OPENURMA_VDEV_INCLUDE}/openurma_vdev_q5.h")
-    target_include_directories(SparkUrma PRIVATE ${OPENURMA_VDEV_INCLUDE})
-endif()
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${JNI_INCLUDE_DIRS})
 target_compile_features(SparkUrma PRIVATE cxx_std_17)
 target_compile_options(SparkUrma PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(SparkUrma PRIVATE
-    ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread ${CMAKE_DL_LIBS}
+    ${URMA_LIBRARY} pthread
 )
 include(GNUInstallDirs)
 install(TARGETS SparkUrma LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -107,21 +88,21 @@ if(BUILD_TESTS)
     add_executable(native_lifecycle_test tests/native_lifecycle_test.cpp src/chunk_protocol.cpp
         $<TARGET_OBJECTS:spark_urma_obj>)
     target_include_directories(native_lifecycle_test PRIVATE
-        ${URMA_INC} ${URMA_COMMON_INC} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${URMA_INC} ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(native_lifecycle_test PRIVATE
-        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread)
+        ${URMA_LIBRARY} pthread)
     add_executable(request_state_test tests/request_state_test.cpp
         $<TARGET_OBJECTS:spark_urma_obj>)
     target_include_directories(request_state_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${URMA_COMMON_INC})
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC})
     target_compile_options(request_state_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(request_state_test PRIVATE
-        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread)
+        ${URMA_LIBRARY} pthread)
     add_executable(remote_import_cache_test tests/remote_import_cache_test.cpp
         $<TARGET_OBJECTS:spark_urma_obj>)
     target_include_directories(remote_import_cache_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${URMA_COMMON_INC})
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC})
     target_compile_options(remote_import_cache_test PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(remote_import_cache_test PRIVATE
-        ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread)
+        ${URMA_LIBRARY} pthread)
 endif()

@@ -9,37 +9,10 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
-#include <dlfcn.h>
 
 extern "C" {
 #include "urma_api.h"
 #include "urma_types.h"
-#if __has_include("openurma_vdev_q5.h")
-// The shipped Q8 ABI header is C-only and uses _Static_assert, which is not
-// accepted by the C++ compiler.  Keep the stable 64-byte MR response layout
-// local and call the optional helper through its C ABI instead of including
-// the C header in this C++ translation unit.
-struct spark_openurma_vdev_mr_resp {
-    uint32_t magic;
-    uint16_t abi_major;
-    uint16_t abi_minor;
-    uint64_t generation;
-    uint64_t va;
-    uint64_t len;
-    uint32_t token_id;
-    uint32_t access;
-    uint32_t pinned_pages;
-    uint32_t eid_index;
-    uint32_t state;
-    uint32_t reserved0;
-    uint64_t reserved[1];
-};
-static_assert(sizeof(spark_openurma_vdev_mr_resp) == 64,
-              "Q8 MR response ABI size");
-int openurma_vdev_q5_mr_info(urma_target_seg_t *seg,
-                             spark_openurma_vdev_mr_resp *info);
-#define SPARK_URMA_HAS_VDEV_MR_INFO 1
-#endif
 }
 
 namespace spark_urma {
@@ -51,22 +24,6 @@ bool g_runtime_shutdown = false;
 uint64_t g_transport_epoch = 0;
 uint64_t g_runtime_init_calls = 0;
 uint64_t g_runtime_uninit_calls = 0;
-
-#if defined(SPARK_URMA_HAS_VDEV_MR_INFO)
-using SparkUrmaVdevMrInfoFn = int (*)(urma_target_seg_t *, spark_openurma_vdev_mr_resp *);
-
-SparkUrmaVdevMrInfoFn resolve_vdev_mr_info() {
-    void* symbol = dlsym(RTLD_DEFAULT, "openurma_vdev_q5_mr_info");
-    if (symbol == nullptr) {
-        // liburma normally loads the provider before SCache starts.  Some
-        // loaders keep provider symbols local, so make the already-loaded
-        // plugin visible without taking ownership of a second provider.
-        void* handle = dlopen("liburma_openurma_vdev.so", RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
-        if (handle != nullptr) symbol = dlsym(handle, "openurma_vdev_q5_mr_info");
-    }
-    return reinterpret_cast<SparkUrmaVdevMrInfoFn>(symbol);
-}
-#endif
 
 std::string join_errors(const std::vector<std::string>& errors) {
     std::ostringstream out;
@@ -102,14 +59,6 @@ void UrmaTransport::init(const TransportOptions& options) {
     if (options.device_name.empty() || options.queue_depth == 0 ||
         options.max_chunk_bytes == 0) {
         throw std::runtime_error("ERR_INVALID_ARG: invalid device/queue/maxChunkBytes");
-    }
-
-    const char* launcher_role = std::getenv("OPENURMA_WIRE_ROLE");
-    if (launcher_role == nullptr || *launcher_role == '\0') {
-        throw std::runtime_error("ERR_INIT: OPENURMA_WIRE_ROLE must be set by launcher");
-    }
-    if (!options.wire_role.empty() && options.wire_role != launcher_role) {
-        throw std::runtime_error("ERR_INIT: launcher OPENURMA_WIRE_ROLE conflicts with expected role");
     }
 
     options_ = options;
@@ -179,8 +128,7 @@ void UrmaTransport::init(const TransportOptions& options) {
         jfc_ = urma_create_jfc(ctx_, &jfc_cfg);
         if (jfc_ == nullptr) throw std::runtime_error("urma_create_jfc failed");
 
-        // Q8 exposes post_jfs_wr (not post_jetty_send_wr). Keep a standalone
-        // JFS for data-plane posts; the Jetty remains the endpoint.
+        // Keep a standalone JFS for data-plane posts; the Jetty remains the endpoint.
         urma_jfs_cfg_t jfs_cfg = {};
         jfs_cfg.depth = options_.queue_depth;
         jfs_cfg.trans_mode = URMA_TM_RC;
@@ -192,7 +140,7 @@ void UrmaTransport::init(const TransportOptions& options) {
         jfr_cfg.depth = options_.queue_depth;
         jfr_cfg.trans_mode = URMA_TM_RC;
         jfr_cfg.jfc = jfc_;
-        jfr_cfg.token_value.token = 0xDEADBEEF;
+        jfr_cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
         jfr_ = urma_create_jfr(ctx_, &jfr_cfg);
         if (jfr_ == nullptr) throw std::runtime_error("urma_create_jfr failed");
 
@@ -300,8 +248,8 @@ void UrmaTransport::connect(const EndpointDescriptor& remote) {
     remote_jetty.jetty_id.uasid = remote.uasid;
     remote_jetty.jetty_id.id = remote.jetty_id;
     remote_jetty.trans_mode = URMA_TM_RC;
-    urma_token_t token = {.token = 0xDEADBEEF};
-    remote_jetty_ = urma_import_jetty(ctx_, &remote_jetty, &token);
+    remote_jetty.flag.bs.token_policy = URMA_TOKEN_NONE;
+    remote_jetty_ = urma_import_jetty(ctx_, &remote_jetty, nullptr);
     if (remote_jetty_ == nullptr) throw std::runtime_error("ERR_CONNECTION: urma_import_jetty failed");
     if (urma_bind_jetty(jetty_, remote_jetty_) != URMA_SUCCESS) {
         (void)urma_unimport_jetty(remote_jetty_);
@@ -339,7 +287,7 @@ RegisteredRegion UrmaTransport::register_region(void* address, size_t length) {
     cfg.va = base;
     cfg.len = length;
     cfg.token_id = token_id;
-    cfg.token_value.token = 0xDEADBEEF;
+    cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
     cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
     cfg.flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
     urma_target_seg_t* segment = urma_register_seg(ctx_, &cfg);
@@ -352,44 +300,10 @@ RegisteredRegion UrmaTransport::register_region(void* address, size_t length) {
     region.handle = next_region_handle_++;
     region.address = address;
     region.length = length;
-    region.remote_address = cfg.va;
+    region.remote_address = segment->seg.ubva.va != 0 ? segment->seg.ubva.va : cfg.va;
+    region.length = segment->seg.len != 0 ? segment->seg.len : length;
     region.token = segment->seg.token_id;
-    // The Q8 native-vdev provider uses the fourth urma_import_seg argument as
-    // the registered-MR generation.  It is intentionally not part of the
-    // public urma_seg_t, so consume the provider's diagnostic ABI when it is
-    // available.  Other providers keep generation=0 and retain the public
-    // NOMAP import semantics.
-#if defined(SPARK_URMA_HAS_VDEV_MR_INFO)
-    spark_openurma_vdev_mr_resp mr_info = {};
-    const auto mr_info_fn = resolve_vdev_mr_info();
-    bool vdev_mr_info_valid = false;
-    if (mr_info_fn != nullptr && mr_info_fn(segment, &mr_info) == 0) {
-        vdev_mr_info_valid = true;
-        region.generation = mr_info.generation;
-        std::fprintf(stderr, "SPARK_URMA_MR ctx_eid=%02x%02x%02x%02x seg_eid=%02x%02x%02x%02x eid_index=%u token=%u gen=%llu\n",
-                     ((unsigned char*)&ctx_->eid)[0], ((unsigned char*)&ctx_->eid)[1], ((unsigned char*)&ctx_->eid)[2], ((unsigned char*)&ctx_->eid)[3],
-                     ((unsigned char*)&segment->seg.ubva.eid)[0], ((unsigned char*)&segment->seg.ubva.eid)[1], ((unsigned char*)&segment->seg.ubva.eid)[2], ((unsigned char*)&segment->seg.ubva.eid)[3], mr_info.eid_index, mr_info.token_id, (unsigned long long)mr_info.generation);
-        // The Q8 provider's public urma_seg_t leaves token_id unset while
-        // retaining the provider-issued token in its diagnostic MR record.
-        // Exchange that real token, plus the provider canonical VA/length,
-        // so urma_import_seg can validate the peer MR.
-        if (mr_info.token_id != 0) region.token = mr_info.token_id;
-        if (mr_info.va != 0) region.remote_address = mr_info.va;
-        if (mr_info.len != 0) region.length = mr_info.len;
-        local_ep_.segment_uasid = mr_info.eid_index;
-        local_ep_.segment_generation = mr_info.generation;
-    }
-#endif
-#if defined(SPARK_URMA_HAS_VDEV_MR_INFO)
-    // Q8 uses eid_index=0 as a valid device-local segment identity.  Do not
-    // treat zero as "missing" and replace it with the public ubva.uasid
-    // (typically 4096); that value is not accepted by the provider's MR
-    // lookup and makes every remote READ complete with REM_ACCESS_ABORT.
-    if (!vdev_mr_info_valid && local_ep_.segment_uasid == 0)
-        local_ep_.segment_uasid = segment->seg.ubva.uasid;
-#else
-    if (local_ep_.segment_uasid == 0) local_ep_.segment_uasid = segment->seg.ubva.uasid;
-#endif
+    local_ep_.segment_uasid = segment->seg.ubva.uasid;
     region.owner_epoch = owner_epoch_;
     LocalRegionState state;
     state.region = region;
@@ -525,12 +439,12 @@ UrmaTransport::ImportedRegionState& UrmaTransport::find_or_import_remote_locked(
     segment.ubva.va = remote.remote_address;
     segment.len = remote.length;
     segment.token_id = static_cast<uint32_t>(remote.token);
-    urma_token_t token = {.token = 0xDEADBEEF};
-    // The per-arena provider MR generation travels with RemoteBuffer.  The
-    // endpoint generation is only a bootstrap/default and is not sufficient
-    // when a peer has more than one registered arena.
+    segment.attr.bs.token_policy = URMA_TOKEN_NONE;
+    segment.attr.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    // With NOMAP import, the public UMDK API requires addr=0. SCache validates
+    // its logical block generation independently before issuing the operation.
     urma_target_seg_t* imported = urma_import_seg(
-        ctx_, &segment, &token, remote.generation, urma_import_seg_flag_t{});
+        ctx_, &segment, nullptr, 0, urma_import_seg_flag_t{});
     std::fprintf(stderr, "SPARK_URMA_IMPORT remote_seg_uasid=%u remote_eid=%02x%02x%02x%02x... addr=%#llx token=%llu seggen=%llu\n",
                  remote_ep_.segment_uasid, remote_ep_.eid[0], remote_ep_.eid[1], remote_ep_.eid[2], remote_ep_.eid[3],
                  (unsigned long long)remote.remote_address, (unsigned long long)remote.token, (unsigned long long)remote.generation);

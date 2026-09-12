@@ -17,10 +17,17 @@ public final class RealUbTransport implements UbTransport {
     }
 
     public static RealUbTransport open(String deviceName, int queueDepth, int maxChunkBytes,
-                                       boolean strict, String wireRole) {
+                                       boolean strict) {
         UrmaTransport transport =
-            UrmaTransport.open(deviceName, queueDepth, maxChunkBytes, strict, wireRole);
+            UrmaTransport.open(deviceName, queueDepth, maxChunkBytes, strict);
         return new RealUbTransport(transport, queueDepth);
+    }
+
+    /** Compatibility overload for the former virtual-provider launcher API. */
+    @Deprecated
+    public static RealUbTransport open(String deviceName, int queueDepth, int maxChunkBytes,
+                                       boolean strict, String ignoredRole) {
+        return open(deviceName, queueDepth, maxChunkBytes, strict);
     }
 
     static UbTransportCapabilities capabilitiesFor(int queueDepth, int maxChunkBytes) {

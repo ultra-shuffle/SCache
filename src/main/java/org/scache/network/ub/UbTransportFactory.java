@@ -12,12 +12,12 @@ public final class UbTransportFactory {
     }
 
     public static UbTransport open(String backend, String deviceName, int queueDepth,
-                                   int maxChunkBytes, boolean strict, String wireRole) {
+                                   int maxChunkBytes, boolean strict) {
         String selected = normalizeBackend(backend);
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException(
                 "Unsupported production scache.ub.transport=" + selected + "; use real");
         }
-        return RealUbTransport.open(deviceName, queueDepth, maxChunkBytes, strict, wireRole);
+        return RealUbTransport.open(deviceName, queueDepth, maxChunkBytes, strict);
     }
 }

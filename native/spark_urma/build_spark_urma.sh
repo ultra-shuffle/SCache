@@ -3,16 +3,25 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-URMA_ROOT="${OU_UMDK_BUILD:?OU_UMDK_BUILD must point to the built UMDK tree}"
 BUILD_DIR="${SPARK_URMA_BUILD_DIR:-$HERE/build}"
 INSTALL_PREFIX="${SPARK_URMA_INSTALL_PREFIX:-$BUILD_DIR/install}"
-JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-17-openjdk-amd64}"
 JOBS="${SPARK_URMA_BUILD_JOBS:-2}"
+
+if [[ -z "${JAVA_HOME:-}" ]]; then
+  JAVAC="$(command -v javac || true)"
+  [[ -n "$JAVAC" ]] || { echo "set JAVA_HOME or install a JDK" >&2; exit 1; }
+  JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$JAVAC")")")"
+fi
+
+CMAKE_UMDK=()
+if [[ -n "${UMDK_ROOT:-}" ]]; then
+  CMAKE_UMDK=(-DUMDK_ROOT="$UMDK_ROOT")
+fi
 
 cmake -S "$HERE" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-  -DURMA_ROOT="$URMA_ROOT" \
+  "${CMAKE_UMDK[@]}" \
   -DBUILD_TESTS=OFF \
   -DBUILD_STANDALONE=OFF \
   -DJAVA_HOME="$JAVA_HOME"

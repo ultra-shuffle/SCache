@@ -14,8 +14,7 @@ namespace spark_urma {
 
 // ---- Transport configuration ----
 struct TransportOptions {
-    std::string device_name = "openurma0";
-    std::string wire_role = "connect";    // Tier S wire role: "listen" or "connect"
+    std::string device_name;
     uint32_t queue_depth = 128;
     uint32_t poll_batch = 32;
     uint32_t request_timeout_ms = 30000;
@@ -30,9 +29,8 @@ struct RegisteredRegion {
     size_t length = 0;
     uint64_t remote_address = 0;
     uint64_t token = 0;
-    // Provider-specific memory-registration generation.  Native-vdev Q8 uses
-    // this value as the NOMAP import cookie; generic UMDK backends may leave it
-    // zero and use the normal public import argument semantics.
+    // Optional provider generation. Official UMDK providers may leave it zero;
+    // logical block generation is enforced independently by SCache.
     uint64_t generation = 0;
     uint64_t owner_epoch = 0;
 };
@@ -87,8 +85,8 @@ struct EndpointDescriptor {
     // Provider segment EID index; the jetty uasid above remains the value
     // required for urma_import_jetty. Serialized in the former final pad.
     uint32_t segment_uasid = 0;
-    // Provider MR generation (Q8 NOMAP import cookie), appended after the
-    // original 64-byte descriptor for protocol-compatible extension.
+    // Optional provider MR generation, appended after the original 64-byte
+    // descriptor for protocol-compatible extension.
     uint64_t segment_generation = 0;
 
     // Serialize to/from network byte order
