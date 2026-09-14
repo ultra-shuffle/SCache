@@ -285,7 +285,7 @@ public final class UrmaTransport implements AutoCloseable {
 
     private void checkRemote(RemoteBuffer remote) {
         if (remote == null) throw new UrmaException("remote buffer must not be null");
-        if (remote.remoteAddress <= 0 || remote.length <= 0 || remote.token < 0) {
+        if (remote.remoteAddress <= 0 || remote.length <= 0) {
             throw new UrmaException("invalid remote region descriptor");
         }
     }

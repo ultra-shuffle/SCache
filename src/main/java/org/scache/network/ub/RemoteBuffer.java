@@ -2,6 +2,7 @@ package org.scache.network.ub;
 public class RemoteBuffer {
     public final long remoteAddress;
     public final long length;
+    /** Raw unsigned 32-bit URMA token bits. */
     public final int token;
     /** Provider-specific registration generation (zero for generic backends). */
     public final long generation;

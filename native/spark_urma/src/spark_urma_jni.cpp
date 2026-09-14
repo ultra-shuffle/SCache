@@ -276,7 +276,7 @@ Java_org_scache_network_ub_UrmaNative_nativeWrite(
         RemoteRegion remote;
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
-        remote.token = static_cast<uint64_t>(remoteToken);
+        remote.token = static_cast<uint64_t>(static_cast<uint32_t>(remoteToken));
         remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->write(remote, addr, static_cast<size_t>(length));
@@ -306,7 +306,7 @@ Java_org_scache_network_ub_UrmaNative_nativeRead(
         RemoteRegion remote;
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
-        remote.token = static_cast<uint64_t>(remoteToken);
+        remote.token = static_cast<uint64_t>(static_cast<uint32_t>(remoteToken));
         remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->read(remote, addr, static_cast<size_t>(length));
@@ -387,7 +387,7 @@ Java_org_scache_network_ub_UrmaNative_nativeWriteChunked(
         RemoteRegion remote;
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
-        remote.token = static_cast<uint64_t>(remoteToken);
+        remote.token = static_cast<uint64_t>(static_cast<uint32_t>(remoteToken));
         remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->write_chunked(remote, addr,
@@ -418,7 +418,7 @@ Java_org_scache_network_ub_UrmaNative_nativeReadChunked(
         RemoteRegion remote;
         remote.remote_address = static_cast<uint64_t>(remoteAddr);
         remote.length = static_cast<uint64_t>(remoteLen);
-        remote.token = static_cast<uint64_t>(remoteToken);
+        remote.token = static_cast<uint64_t>(static_cast<uint32_t>(remoteToken));
         remote.generation = static_cast<uint64_t>(remoteGeneration);
 
         uint64_t req_id = transport->read_chunked(remote, addr,

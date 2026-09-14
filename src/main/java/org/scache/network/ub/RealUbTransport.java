@@ -60,13 +60,13 @@ public final class RealUbTransport implements UbTransport {
     @Override
     public UbRegisteredBuffer registerBuffer(ByteBuffer buffer) {
         UrmaTransport.RegisteredBuffer registered = delegate.registerBuffer(buffer);
-        if (registered.token < 0 || registered.token > Integer.MAX_VALUE) {
+        if (registered.token < 0 || registered.token > 0xffff_ffffL) {
             try {
                 delegate.unregisterBuffer(registered);
             } catch (RuntimeException cleanup) {
                 // Preserve the descriptor error as the primary failure.
             }
-            throw new UrmaException("registered buffer token does not fit the neutral descriptor");
+            throw new UrmaException("registered buffer token does not fit unsigned 32 bits");
         }
         return new UbRegisteredBuffer(this, registered, registered.handle, registered.generation,
             registered.buffer, registered.remoteAddress, registered.length, (int) registered.token);
@@ -107,7 +107,7 @@ public final class RealUbTransport implements UbTransport {
 
     static RemoteBuffer window(RemoteBuffer remote, long remoteOffset, int length) {
         if (remote == null) throw new UrmaException("remote buffer must not be null");
-        if (remote.remoteAddress <= 0 || remote.length <= 0 || remote.token < 0) {
+        if (remote.remoteAddress <= 0 || remote.length <= 0) {
             throw new UrmaException("invalid remote region descriptor");
         }
         if (remoteOffset < 0 || length < 0 || remoteOffset > remote.length

@@ -23,7 +23,6 @@
 
 struct urma_context;
 struct urma_jetty;
-struct urma_jfs;
 struct urma_jfc;
 struct urma_jfr;
 struct urma_target_seg;
@@ -31,7 +30,6 @@ struct urma_target_jetty;
 struct urma_token_id;
 typedef struct urma_context   urma_context_t;
 typedef struct urma_jetty     urma_jetty_t;
-typedef struct urma_jfs       urma_jfs_t;
 typedef struct urma_jfc       urma_jfc_t;
 typedef struct urma_jfr       urma_jfr_t;
 typedef struct urma_target_seg urma_target_seg_t;
@@ -103,15 +101,11 @@ private:
     // Lock that serializes ALL provider/SystemC calls
     mutable std::mutex owner_mutex_;
     std::thread::id owner_tid_;
-    void assert_owner_or_lock();
-
     // URMA handles
     urma_context_t* ctx_ = nullptr;
     urma_jetty_t* jetty_ = nullptr;
-    urma_jfs_t* jfs_ = nullptr;
     urma_jfc_t* jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;
-    urma_target_seg_t* local_seg_ = nullptr;
     urma_target_jetty_t* remote_jetty_ = nullptr;
     struct ImportedRegionState {
         RemoteRegion region;
@@ -170,9 +164,6 @@ private:
     std::condition_variable completion_cv_;
     std::atomic<uint64_t> request_seq_{1};
     TransportMetrics metrics_;
-
-    void* local_buffer_ = nullptr;
-    size_t local_buffer_size_ = 0;
 
     uint64_t owner_epoch_ = 0;
     bool owns_runtime_slot_ = false;

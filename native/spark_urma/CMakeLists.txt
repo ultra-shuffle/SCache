@@ -40,7 +40,6 @@ set(JNI_INCLUDE_DIRS "${JNI_INCLUDE_DIR}" "${JNI_MD_INCLUDE_DIR}")
 # ---- Library ----
 set(SOURCES
     src/urma_transport.cpp
-    src/tcp_control_channel.cpp
 )
 
 set(HEADERS

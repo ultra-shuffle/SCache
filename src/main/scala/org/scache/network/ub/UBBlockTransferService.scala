@@ -901,9 +901,6 @@ private[scache] class UBBlockTransferService(
       "urma.transportFailedOperations" -> native.map(_.failedOperations).getOrElse(0L),
       "urma.transportTimedOutOperations" -> native.map(_.timedOutOperations).getOrElse(0L),
       "urma.transportInflightOperations" -> native.map(_.inflightOperations).getOrElse(0L),
-      "urma.carrierBytes" -> native.map(backend(_, "carrierBytes")).getOrElse(0L),
-      "urma.carrierLateOperations" -> native.map(_.carrierLateOperations).getOrElse(0L),
-      "urma.controlPayloadBytes" -> native.map(backend(_, "controlPayloadBytes")).getOrElse(0L),
       "urma.activeMappings" -> native.map(backend(_, "activeMappings")).getOrElse(0L),
       "urma.activeTokens" -> native.map(backend(_, "registeredTokens")).getOrElse(0L),
       "urma.activeSlots" -> native.map(backend(_, "activeSlots")).getOrElse(0L),
@@ -975,7 +972,7 @@ private[ub] object UBBlockTransferService {
           s"expected=$blockId/${peer.nodeId}/${peer.epoch}")
     }
     if (descriptor.offset < 0 || descriptor.length < 0 || descriptor.baseAddress <= 0 ||
-        descriptor.remoteAddress != descriptor.baseAddress + descriptor.offset || descriptor.token < 0) {
+        descriptor.remoteAddress != descriptor.baseAddress + descriptor.offset) {
       throw new IllegalStateException(s"invalid UB descriptor bounds for $blockId")
     }
   }
@@ -1000,8 +997,8 @@ private[ub] object UBBlockTransferService {
   private[ub] final case class Descriptor(protocolVersion: Int, nodeId: String, epoch: Long, arenaId: String,
       baseAddress: Long, offset: Int, remoteAddress: Long, length: Int, token: Int,
       segmentGeneration: Long, generation: Long, crc: Long, leaseId: String, blockId: String) {
-    // generation is the lease/block generation; segmentGeneration is the
-    // provider MR generation required by native-vdev import.
+    // generation is the lease/block generation. segmentGeneration is retained
+    // for descriptor compatibility and is zero with generic public UMDK providers.
     def remote: RemoteBuffer = new RemoteBuffer(remoteAddress, length.toLong, token, segmentGeneration)
   }
   /** Local shared-memory bridge descriptor; remote peers never consume its path. */

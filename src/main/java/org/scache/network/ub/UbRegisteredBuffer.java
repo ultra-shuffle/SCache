@@ -30,7 +30,7 @@ public final class UbRegisteredBuffer {
         if (buffer == null || !buffer.isDirect()) {
             throw new IllegalArgumentException("registered buffer must be a DirectByteBuffer");
         }
-        if (remoteAddress < 0 || length <= 0 || length > buffer.capacity() || token < 0) {
+        if (remoteAddress < 0 || length <= 0 || length > buffer.capacity()) {
             throw new IllegalArgumentException("invalid registered buffer descriptor");
         }
         this.handle = handle;

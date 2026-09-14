@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -127,14 +126,6 @@ void UrmaTransport::init(const TransportOptions& options) {
         jfc_cfg.depth = options_.queue_depth;
         jfc_ = urma_create_jfc(ctx_, &jfc_cfg);
         if (jfc_ == nullptr) throw std::runtime_error("urma_create_jfc failed");
-
-        // Keep a standalone JFS for data-plane posts; the Jetty remains the endpoint.
-        urma_jfs_cfg_t jfs_cfg = {};
-        jfs_cfg.depth = options_.queue_depth;
-        jfs_cfg.trans_mode = URMA_TM_RC;
-        jfs_cfg.jfc = jfc_;
-        jfs_ = urma_create_jfs(ctx_, &jfs_cfg);
-        if (jfs_ == nullptr) throw std::runtime_error("urma_create_jfs failed");
 
         urma_jfr_cfg_t jfr_cfg = {};
         jfr_cfg.depth = options_.queue_depth;
@@ -496,7 +487,7 @@ uint64_t UrmaTransport::post_rw_locked(bool write_op, const RemoteRegion& remote
         std::chrono::milliseconds(std::max<uint32_t>(1, options_.request_timeout_ms));
     for (uint64_t spins = 0; ; ++spins) {
         bad = nullptr;
-        post_status = urma_post_jfs_wr(jfs_, &wr, &bad);
+        post_status = urma_post_jetty_send_wr(jetty_, &wr, &bad);
         if (post_status == URMA_SUCCESS) break;
         if (post_status != URMA_EAGAIN) break;
         // Q8 exposes a finite provider ring. Drain completions while the
@@ -576,7 +567,7 @@ uint64_t UrmaTransport::send(const void* message, size_t length) {
         std::chrono::milliseconds(std::max<uint32_t>(1, options_.request_timeout_ms));
     for (uint64_t spins = 0; ; ++spins) {
         bad = nullptr;
-        post_status = urma_post_jfs_wr(jfs_, &wr, &bad);
+        post_status = urma_post_jetty_send_wr(jetty_, &wr, &bad);
         if (post_status == URMA_SUCCESS) break;
         if (post_status != URMA_EAGAIN) break;
         poll_once_locked();
@@ -959,16 +950,8 @@ void UrmaTransport::cleanup_locked(std::vector<std::string>& errors) {
         item.second.token_id = nullptr;
     }
     registered_regions_.clear();
-    if (local_seg_ != nullptr) {
-        if (urma_unregister_seg(local_seg_) != URMA_SUCCESS) errors.push_back("internal unregister failed");
-        local_seg_ = nullptr;
-    }
-    std::free(local_buffer_);
-    local_buffer_ = nullptr;
     if (jetty_ != nullptr && urma_delete_jetty(jetty_) != URMA_SUCCESS) errors.push_back("urma_delete_jetty failed");
     jetty_ = nullptr;
-    if (jfs_ != nullptr && urma_delete_jfs(jfs_) != URMA_SUCCESS) errors.push_back("urma_delete_jfs failed");
-    jfs_ = nullptr;
     if (jfr_ != nullptr && urma_delete_jfr(jfr_) != URMA_SUCCESS) errors.push_back("urma_delete_jfr failed");
     jfr_ = nullptr;
     if (jfc_ != nullptr && urma_delete_jfc(jfc_) != URMA_SUCCESS) errors.push_back("urma_delete_jfc failed");
