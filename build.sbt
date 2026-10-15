@@ -46,3 +46,19 @@ assemblyMergeStrategy in assembly := {
     val oldStrategy = (assemblyMergeStrategy in assembly).value
     oldStrategy(x)
 }
+
+lazy val scache = (project in file("."))
+
+lazy val sparkExtension = (project in file("spark-extension"))
+  .disablePlugins(AssemblyPlugin)
+  .settings(
+    name := "scache-spark-extension",
+    organization := "org.scache",
+    version := "0.1.0-SNAPSHOT",
+    scalaVersion := "2.12.18",
+    libraryDependencies += "org.apache.spark" %% "spark-core" % "3.5.7" % Provided,
+    Compile / javacOptions ++= Seq("--release", "8", "-Xlint:-options"),
+    Test / javacOptions ++= Seq("--release", "8", "-Xlint:-options"),
+    Compile / scalacOptions += "-target:jvm-1.8",
+    Test / scalacOptions += "-target:jvm-1.8"
+  )
