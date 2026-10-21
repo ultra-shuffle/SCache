@@ -118,6 +118,7 @@ private[scache] class UBBlockTransferService(
   @volatile private var acceptThread: Thread = _
   private val workers: ExecutorService = Executors.newCachedThreadPool()
   private val connectLock = new Object
+  private val urpcTransferAdmission = new Object
   @volatile private var connectedPeer: Array[Byte] = _
   // Blocks imported into this node's destination arena are not represented as local BlockManager
   // payloads. Keep their ids so application cleanup can retire only imported slices; owner blocks
@@ -959,6 +960,16 @@ private[scache] class UBBlockTransferService(
   }
 
   private def withControl[T](host: String, remotePort: Int)(body: (ControlChannel, PeerIdentity) => T): T = {
+    // The experimental URPC backend has one blocking logical operation at a time.
+    // Admit BEFORE acquiring the peer lease, not inside JNI after acquisition:
+    // otherwise queued reads keep peer control channels idle until their timeout.
+    if (transportBackend == "urpc") {
+      urpcTransferAdmission.synchronized { withControlAdmitted(host, remotePort)(body) }
+    } else withControlAdmitted(host, remotePort)(body)
+  }
+
+  private def withControlAdmitted[T](host: String, remotePort: Int)(
+      body: (ControlChannel, PeerIdentity) => T): T = {
     val socket = new Socket()
     try {
       socket.connect(new InetSocketAddress(host, remotePort), timeoutMs)

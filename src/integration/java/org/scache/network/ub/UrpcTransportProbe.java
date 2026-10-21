@@ -15,8 +15,9 @@ public final class UrpcTransportProbe {
         Path file = Paths.get(args[1]);
         Path done = Paths.get(args[1] + ".done");
         UbTransport t = UbTransportFactory.open("urpc", server ? "openurma0" : "openurma1",
-            64, 4096, true, UrmaConnectionConfig.legacyRc());
-        ByteBuffer arena = ByteBuffer.allocateDirect(65536);
+            64, 32768, true, UrmaConnectionConfig.legacyRc());
+        int bulk = Integer.parseInt(System.getenv().getOrDefault("URPC_BULK_MIB", "0")) * 1048576;
+        ByteBuffer arena = ByteBuffer.allocateDirect(Math.max(131072, bulk + 131072));
         for (int i = 0; i < arena.capacity(); i++) arena.put(i, (byte) (i * 31 + 7));
         UbRegisteredBuffer registration = t.registerBuffer(arena);
         if (server) {
@@ -44,15 +45,26 @@ public final class UrpcTransportProbe {
             check(t.waitFor(id, 1000) == 0, "read completion");
             for (int i = 0; i < 4096; i++)
                 check(arena.get(11 + i) == (byte) ((123 + i) * 31 + 7), "read content " + i);
-            for (int i = 0; i < 12500; i++) arena.put(32768 + i, (byte) (i ^ 0x5a));
-            id = t.write(remote, 8192, arena, 32768, 12500);
+            for (int i = 0; i < 70000; i++) arena.put(32768 + i, (byte) (i ^ 0x5a));
+            id = t.write(remote, 8192, arena, 32768, 70000);
             check(t.waitFor(id, 1000) == 0, "write completion");
-            id = t.read(remote, 8192, arena, 1024, 12500);
+            id = t.read(remote, 8192, arena, 1024, 70000);
             check(t.waitFor(id, 1000) == 0, "readback completion");
-            for (int i = 0; i < 12500; i++)
+            for (int i = 0; i < 70000; i++)
                 check(arena.get(1024 + i) == (byte) (i ^ 0x5a), "write/readback " + i);
-            try { t.read(remote, 65530, arena, 0, 100); throw new AssertionError("bounds accepted"); }
+            try { t.read(remote, remote.length-6, arena, 0, 100); throw new AssertionError("bounds accepted"); }
             catch (IllegalArgumentException expected) {}
+            if (bulk > 0) {
+                long started = System.nanoTime();
+                id = t.read(remote, 0, arena, 0, bulk);
+                check(t.waitFor(id, 1000) == 0, "bulk read completion");
+                for (int i = 0; i < bulk; i++) {
+                    byte expected = i >= 8192 && i < 8192 + 70000 ?
+                        (byte) ((i - 8192) ^ 0x5a) : (byte) (i * 31 + 7);
+                    check(arena.get(i) == expected, "bulk content " + i);
+                }
+                System.out.println("URPC_BULK_PASS bytes=" + bulk + " elapsed_ms=" + (System.nanoTime()-started)/1000000);
+            }
             SegmentDescriptor stale = new SegmentDescriptor(s.eid(), s.uasid, s.attributes,
                 s.address, s.length, s.token, s.generation + 1);
             try {

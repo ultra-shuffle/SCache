@@ -36,7 +36,7 @@ Java_org_scache_network_ub_UrpcNative_start(JNIEnv* env,jclass,jstring eid,jstri
         ever_started=true;
         runtime=new scache_urpc::Engine(e,h,static_cast<uint16_t>(port),d);
         auto ep=runtime->endpoint;
-        return longs(env,{ep.qid,static_cast<jlong>(ep.function),ep.port});
+        return longs(env,{ep.qid,static_cast<jlong>(ep.function),ep.port,scache_urpc::CHUNK});
     } catch(const std::exception& e) {raise(env,e);return nullptr;}
 }
 extern "C" JNIEXPORT void JNICALL
@@ -70,7 +70,7 @@ Java_org_scache_network_ub_UrpcNative_transfer(JNIEnv* env,jclass,jlong address,
     try {
         auto* ptr=static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
         jlong capacity=env->GetDirectBufferCapacity(buffer);
-        scache_urpc::check(ptr && local_offset>=0 && length>0 && length<=4096 &&
+        scache_urpc::check(ptr && local_offset>=0 && length>0 && length<=static_cast<jint>(scache_urpc::CHUNK) &&
             local_offset<=capacity-length && remote_offset>=0 && size>0 &&
             remote_offset<=size && length<=size-remote_offset,"invalid JNI window");
         ptr+=local_offset;

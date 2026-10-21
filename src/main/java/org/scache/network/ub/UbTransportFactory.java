@@ -2,7 +2,7 @@ package org.scache.network.ub;
 
 import java.util.Locale;
 
-/** Single real-URMA backend selection point below UBBlockTransferService. */
+/** Explicit native-backend selection below UBBlockTransferService; no implicit fallback. */
 public final class UbTransportFactory {
     private UbTransportFactory() {}
 
@@ -15,7 +15,7 @@ public final class UbTransportFactory {
                                    int maxChunkBytes, boolean strict, String wireRole) {
         String selected = normalizeBackend(backend);
         if ("urpc".equals(selected))
-            return UrpcUbTransport.open(queueDepth, UrmaConnectionConfig.legacyRc());
+            return UrpcUbTransport.open(queueDepth, maxChunkBytes, UrmaConnectionConfig.legacyRc());
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException(
                 "Unsupported production scache.ub.transport=" + selected + "; use real");
@@ -26,7 +26,7 @@ public final class UbTransportFactory {
     public static UbTransport open(String backend, String deviceName, int queueDepth,
                                    int maxChunkBytes, boolean strict, UrmaConnectionConfig config) {
         String selected = normalizeBackend(backend);
-        if ("urpc".equals(selected)) return UrpcUbTransport.open(queueDepth, config);
+        if ("urpc".equals(selected)) return UrpcUbTransport.open(queueDepth, maxChunkBytes, config);
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException("Unsupported production scache.ub.transport=" + selected);
         }

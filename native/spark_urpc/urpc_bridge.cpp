@@ -25,7 +25,7 @@ extern "C" {
 #include "urma_api.h"
 }
 namespace scache_urpc {
-static constexpr size_t SLOT=8192, SLOTS=4096, CHUNK=4096;
+static constexpr size_t SLOT=65536, SLOTS=512, CHUNK=32768;
 static uint8_t* pool=nullptr;
 static uint64_t pool_mh=0;
 static std::vector<size_t> free_slots;
