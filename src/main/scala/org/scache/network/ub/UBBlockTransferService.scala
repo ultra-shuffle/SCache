@@ -71,8 +71,8 @@ private[scache] class UBBlockTransferService(
     conf.getBoolean("scache.ub.checksum.enabled", true)
   private val transportBackend =
     UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
-  require(transportBackend == "real",
-    s"production SCache supports only scache.ub.transport=real; got $transportBackend")
+  require(transportBackend == "real" || transportBackend == "urpc",
+    s"unsupported scache.ub.transport=$transportBackend; no implicit fallback")
   private val controlBindHost = conf.getString("spark.urma.controlBindHost", localHostName).trim
   // BlockManager registers BlockTransferService.hostName with the master. It must advertise the
   // same reachable address as the UB control listener, not the local bind/default hostname.
@@ -1091,7 +1091,15 @@ private[scache] class UBBlockTransferService(
       "urma.nativeInflight" -> native.map(backend(_, "inflightRequests")).getOrElse(0L),
       "urma.registeredRegions" -> native.map(_.registeredRegions).getOrElse(0L),
       "urma.activeImports" -> native.map(backend(_, "activeImports")).getOrElse(0L),
-      "urma.activeTransports" -> native.map(backend(_, "activeTransports")).getOrElse(0L))
+      "urma.activeTransports" -> native.map(backend(_, "activeTransports")).getOrElse(0L),
+      "urpc.rpcCalls" -> native.map(backend(_, "urpc.rpcCalls")).getOrElse(0L),
+      "urpc.rpcCompleted" -> native.map(backend(_, "urpc.rpcCompleted")).getOrElse(0L),
+      "urpc.rpcFailed" -> native.map(backend(_, "urpc.rpcFailed")).getOrElse(0L),
+      "urpc.readBytes" -> native.map(backend(_, "urpc.readBytes")).getOrElse(0L),
+      "urpc.writeBytes" -> native.map(backend(_, "urpc.writeBytes")).getOrElse(0L),
+      "urpc.stagingCopyBytes" -> native.map(backend(_, "urpc.stagingCopyBytes")).getOrElse(0L),
+      "urpc.frameworkNative" -> native.map(backend(_, "urpc.frameworkNative")).getOrElse(0L),
+      "urpc.hardwareVerified" -> 0L)
   }
 
   private def crc(buffer: ByteBuffer, length: Int): Long = UBBlockTransferService.crc(buffer, length)

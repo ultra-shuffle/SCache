@@ -4,7 +4,7 @@ import java.util.Objects;
 
 /** Immutable capabilities advertised by the real URMA transport backend. */
 public final class UbTransportCapabilities {
-    public enum BackendClass { REAL }
+    public enum BackendClass { REAL, OFFICIAL_URPC }
 
     public final String backendName;
     public final BackendClass backendClass;

@@ -74,13 +74,26 @@ class Engine {
     std::deque<std::function<void()>> commands;
     std::atomic<bool> stopping{false};
     std::exception_ptr fatal;
-    uint64_t qh=0, fid=0, peer_fid=0, seq=0;
+    uint64_t qh=0, client_qh=0, fid=0, peer_fid=0, seq=0;
+    uint64_t remote_qh=0, responses_outstanding=0;
+    uint32_t remote_qid=0;
     uint32_t chid=URPC_U32_FAIL;
     urpc_host_info_t peer{};
     bool attached=false, ready_rpc=false;
+    std::atomic<bool> closed{false};
     std::map<uint64_t,Region> regions;
     struct Response { bool done=false; int status=0; std::vector<uint8_t> bytes; };
     Response* waiting=nullptr;
+    void post_receive(uint64_t handle) {
+        urpc_sge_t* s=nullptr; uint32_t n=0;
+        if(buf_get(&s,&n,SLOT,nullptr)!=0) {
+            stopping=true;throw std::runtime_error("receive staging exhausted");
+        }
+        if(urpc_queue_rx_post(handle,s,n)!=0) {
+            stopping=true;
+            throw std::runtime_error("receive repost failed; staging retained");
+        }
+    }
     void setup(const std::string& eid,const std::string& ip,uint16_t port,const std::string& dir) {
         urpc_config_t cfg{};
         cfg.role=URPC_ROLE_SERVER_CLIENT;
@@ -102,10 +115,14 @@ class Engine {
         q.rx_buf_size=SLOT; q.rx_depth=64; q.tx_depth=64;
         qh=urpc_queue_create(QUEUE_TRANS_MODE_JETTY,&q);
         check(qh!=0 && qh!=URPC_U64_FAIL,"urpc_queue_create");
-        for (unsigned i=0;i<64;i++) {
-            urpc_sge_t* s=nullptr; uint32_t n=0;
-            check(buf_get(&s,&n,SLOT,nullptr)==0,"initial receive allocation");
-            check(urpc_queue_rx_post(qh,s,n)==0,"initial receive post");
+        client_qh=urpc_queue_create(QUEUE_TRANS_MODE_JETTY,&q);
+        check(client_qh!=0 && client_qh!=URPC_U64_FAIL,"create client queue");
+        for (uint64_t handle : {qh,client_qh}) {
+            for (unsigned i=0;i<64;i++) {
+                urpc_sge_t* s=nullptr; uint32_t n=0;
+                check(buf_get(&s,&n,SLOT,nullptr)==0,"initial receive allocation");
+                check(urpc_queue_rx_post(handle,s,n)==0,"initial receive post");
+            }
         }
         urpc_handler_info_t fn{};
         fn.type=URPC_HANDLER_SYNC; fn.sync_handler=unused_handler;
@@ -150,18 +167,22 @@ class Engine {
             // Submission ownership is ambiguous: retain staging, fail closed.
             throw std::runtime_error("urpc_func_return failed; staging quarantined");
         }
+        ++responses_outstanding;
         buf_put(m.req_recved.args,m.req_recved.args_sge_num,nullptr);
     }
-    void poll() {
-        urpc_poll_option_t option{}; option.urpc_qh=qh;
+    void poll_one(uint64_t handle,uint32_t channel) {
+        urpc_poll_option_t option{}; option.urpc_qh=handle;
         urpc_poll_msg_t msgs[8]{};
-        int n=urpc_func_poll(chid,&option,msgs,8);
+        int n=urpc_func_poll(channel,&option,msgs,8);
         check(n>=0,"urpc_func_poll");
         for(int i=0;i<n;i++) {
             auto& m=msgs[i];
             switch(m.event) {
-            case POLL_EVENT_REQ_RECVED: receive(m); break;
-            case POLL_EVENT_RSP_SENDED: buf_put(m.rsp_sended.rsps,m.rsp_sended.rsps_sge_num,nullptr); break;
+            case POLL_EVENT_REQ_RECVED: receive(m); post_receive(handle); break;
+            case POLL_EVENT_RSP_SENDED:
+                buf_put(m.rsp_sended.rsps,m.rsp_sended.rsps_sge_num,nullptr);
+                check(responses_outstanding>0,"untracked response completion");
+                --responses_outstanding; break;
             case POLL_EVENT_REQ_RSPED: {
                 check(waiting!=nullptr,"unexpected RPC response");
                 auto& r=m.req_rsped; uint32_t h=urpc_hdr_size_get(URPC_RSP,0);
@@ -172,12 +193,16 @@ class Engine {
                 waiting->bytes.assign(b,b+r.rsp_valid_total_size-h-8);
                 if(r.args) buf_put(r.args,r.args_sge_num,nullptr);
                 buf_put(r.rsps,r.rsps_sge_num,nullptr);
-                waiting->done=true; break;
+                waiting->done=true; post_receive(handle); break;
             }
             case POLL_EVENT_REQ_SENDED: buf_put(m.req_sended.args,m.req_sended.args_sge_num,nullptr); break;
             default: throw std::runtime_error("unexpected URPC event="+std::to_string(m.event));
             }
         }
+    }
+    void poll() {
+        poll_one(qh,URPC_U32_FAIL);
+        poll_one(client_qh,chid);
     }
 public:
     Endpoint endpoint{};
@@ -198,13 +223,21 @@ public:
                 }
             } catch(...) {
                 fatal=std::current_exception();
+                try {std::rethrow_exception(fatal);}
+                catch(const std::exception& e){fprintf(stderr,"SCACHE_URPC_IO_FATAL %s\n",e.what());}
+                catch(...){fprintf(stderr,"SCACHE_URPC_IO_FATAL unknown\n");}
                 try {init.set_exception(fatal);} catch(...) {}
                 stopping=true;
             }
         });
         try {started.get();} catch(...) {if(io.joinable())io.join();throw;}
     }
-    ~Engine(){stopping=true;if(io.joinable())io.join();}
+    ~Engine(){
+        stopping=true;if(io.joinable())io.join();
+        // Explicit close is required. Failed close deliberately retains staging.
+    }
+    bool healthy() const {return !stopping && !closed;}
+    bool is_closed() const {return closed;}
     template<class F> auto execute(F f)->decltype(f()) {
         using Result=decltype(f());
         auto task=std::make_shared<std::packaged_task<Result()>>(std::move(f));
@@ -225,22 +258,38 @@ public:
         o.flag=URPC_CHANNEL_CONN_FLAG_TIMEOUT; o.timeout=15000;
         check(urpc_channel_server_attach(chid,&peer,&o)==0,"urpc_channel_server_attach");
         urpc_channel_queue_attr_t a{}; a.type=CHANNEL_QUEUE_TYPE_LOCAL;
-        check(urpc_channel_queue_add(chid,qh,a,&o)==0,"add local queue");
+        check(urpc_channel_queue_add(chid,client_qh,a,&o)==0,"add local queue");
         a.type=CHANNEL_QUEUE_TYPE_REMOTE;
         check(urpc_channel_queue_add(chid,remote.qid,a,&o)==0,"add remote queue");
         urpc_channel_qinfos_t qs{};
         check(urpc_channel_queue_query(chid,&qs)==0 && qs.r_qnum>0,"query channel queues");
-        check(urpc_channel_queue_pair(chid,qh,qs.r_qinfo[0].urpc_qh,&o)==0,"pair queues");
+        remote_qh=qs.r_qinfo[0].urpc_qh;
+        remote_qid=remote.qid;
+        check(urpc_channel_queue_pair(chid,client_qh,qs.r_qinfo[0].urpc_qh,&o)==0,"pair queues");
         peer_fid=remote.function; attached=true;
     });}
     Region grant(void* address,uint64_t n) { return execute([=] {
         const uint64_t a=reinterpret_cast<uint64_t>(address);
         check(a!=0 && n>0 && n<=UINT64_MAX-a,"invalid arena range");
         check(regions.find(a)==regions.end(),"duplicate arena grant");
+        for (const auto& item:regions) {
+            const auto& r=item.second;
+            check(a>=r.address ? a-r.address>=r.length : r.address-a>=n,"overlapping arena grant");
+        }
         uint64_t g=++seq;
-        Region r{a,n,g,g^0x736361636865ULL}; regions.emplace(a,r); return r;
+        Region r{a,n,g,static_cast<uint32_t>(g^0x73636163u)}; regions.emplace(a,r); return r;
     });}
     void revoke(uint64_t address) {execute([=]{check(regions.erase(address)==1,"unknown arena");});}
+    void validate_local(void* address,uint64_t n) {
+        execute([=] {
+            uint64_t a=reinterpret_cast<uint64_t>(address);
+            for(const auto& item:regions) {
+                const auto& r=item.second;
+                if(a>=r.address && a-r.address<=r.length && n<=r.length-(a-r.address))return;
+            }
+            throw std::runtime_error("local range is not granted to this URPC transport");
+        });
+    }
     std::vector<uint8_t> request(Region r,uint64_t offset,size_t n,const uint8_t* write_data=nullptr) {
         std::vector<uint8_t> write_copy;
         if(write_data) write_copy.assign(write_data,write_data+n);
@@ -282,6 +331,66 @@ public:
             return response.bytes;
         });
     }
+    void close() {
+        if(closed)return;
+        execute([this] {
+            check(regions.empty(),"revoke all arena grants before close");
+            check(waiting==nullptr,"RPC still outstanding at close");
+            auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+            while(responses_outstanding) {
+                poll(); check(std::chrono::steady_clock::now()<deadline,"response drain deadline");
+            }
+            urpc_channel_connect_option_t o{};
+            o.flag=URPC_CHANNEL_CONN_FLAG_TIMEOUT; o.timeout=5000;
+            if(attached) {
+                check(urpc_channel_queue_unpair(chid,client_qh,remote_qh,&o)==0,"unpair at close");
+                urpc_channel_queue_attr_t a{}; a.type=CHANNEL_QUEUE_TYPE_REMOTE;
+                check(urpc_channel_queue_rm(chid,remote_qid,a,&o)==0,"remove remote at close");
+                a.type=CHANNEL_QUEUE_TYPE_LOCAL;
+                check(urpc_channel_queue_rm(chid,client_qh,a,&o)==0,"remove local at close");
+                check(urpc_channel_server_detach(chid,&peer,&o)==0,"detach at close");
+                check(urpc_channel_destroy(chid)==0,"destroy channel");
+                chid=URPC_U32_FAIL; attached=false;
+            }
+            for(uint64_t handle : {client_qh,qh}) {
+            check(urpc_queue_modify(handle,QUEUE_STATUS_ERR)==0,"set queue error for flush");
+            bool flush_done=false;
+            while(!flush_done) {
+                urpc_poll_option_t option{};option.urpc_qh=handle;
+                urpc_poll_msg_t msg{};
+                int n=urpc_func_poll(URPC_U32_FAIL,&option,&msg,1);
+                check(n>=0,"close poll");
+                if(n>0) {
+                    if(msg.event==POLL_EVENT_REQ_ERR) {
+                        if(msg.req_err.args)buf_put(msg.req_err.args,msg.req_err.args_sge_num,nullptr);
+                        flush_done=msg.req_err.err_code==URPC_ERR_CR_WR_FLUSH_ERR_DONE;
+                    } else if(msg.event==POLL_EVENT_ERR) {
+                        if(msg.event_err.args)buf_put(msg.event_err.args,msg.event_err.args_sge_num,nullptr);
+                    } else check(false,"unexpected close event");
+                }
+                check(std::chrono::steady_clock::now()<deadline,"queue flush deadline");
+            }
+            int result;
+            while((result=urpc_queue_destroy(handle))!=0) {
+                check(std::chrono::steady_clock::now()<deadline,"peer still owns queue at close");
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            }
+            qh=client_qh=0;
+            check(urpc_func_unregister(fid)==0,"unregister function");
+            {
+                std::lock_guard<std::mutex> lock(pool_mutex);
+                check(free_slots.size()==SLOTS,"RPC staging buffers still owned at close");
+            }
+            check(urpc_mem_seg_unregister(pool_mh)==0,"unregister staging");
+            check(urpc_allocator_unregister()==0,"unregister allocator");
+            urpc_uninit();
+            free(pool);pool=nullptr;pool_mh=0;free_slots.clear();
+            closed=true;stopping=true;
+            fprintf(stderr,"SCACHE_URPC_CLOSE_PASS staging_live=0 arena_grants=0\n");
+        });
+        if(io.joinable())io.join();
+    }
 };
 }
 #ifdef SCACHE_URPC_SMOKE_MAIN
@@ -300,7 +409,7 @@ int main(int argc,char** argv) {
             info<<engine.endpoint.qid<<" "<<engine.endpoint.function<<" "<<engine.endpoint.port<<" "
                 <<region.address<<" "<<region.length<<" "<<region.generation<<" "<<region.cookie<<std::endl;
             info.close();
-            std::this_thread::sleep_for(std::chrono::seconds(25));
+            std::this_thread::sleep_for(std::chrono::seconds(5));
         } else {
             scache_urpc::Endpoint ep{};
             std::ifstream info(argv[5]);
@@ -315,6 +424,8 @@ int main(int argc,char** argv) {
             scache_urpc::check(readback==payload,"WRITE integrity");
             std::cout<<"SCACHE_OFFICIAL_URPC_READ_WRITE_PASS bytes=12288"<<std::endl;
         }
+        engine.revoke(reinterpret_cast<uint64_t>(arena.data()));
+        engine.close();
         return 0;
     } catch(const std::exception& e) {fprintf(stderr,"URPC_BRIDGE_ERROR %s\n",e.what());return 1;}
 }

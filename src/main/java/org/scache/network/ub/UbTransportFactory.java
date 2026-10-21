@@ -14,6 +14,8 @@ public final class UbTransportFactory {
     public static UbTransport open(String backend, String deviceName, int queueDepth,
                                    int maxChunkBytes, boolean strict, String wireRole) {
         String selected = normalizeBackend(backend);
+        if ("urpc".equals(selected))
+            return UrpcUbTransport.open(queueDepth, UrmaConnectionConfig.legacyRc());
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException(
                 "Unsupported production scache.ub.transport=" + selected + "; use real");
@@ -24,6 +26,7 @@ public final class UbTransportFactory {
     public static UbTransport open(String backend, String deviceName, int queueDepth,
                                    int maxChunkBytes, boolean strict, UrmaConnectionConfig config) {
         String selected = normalizeBackend(backend);
+        if ("urpc".equals(selected)) return UrpcUbTransport.open(queueDepth, config);
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException("Unsupported production scache.ub.transport=" + selected);
         }

@@ -38,6 +38,7 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       masterHost: String = "127.0.0.1",
       masterPort: Int = 0,
       backend: String = "netty",
+      ubTransport: String = "real",
       wireRole: String = "",
       wirePath: String = "",
       ubControlPort: Int = 0,
@@ -78,7 +79,19 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     }
     if (options.backend == "ub") {
       conf.set("spark.urma.strict", "true", slient = true)
-      if (options.ubMode == "rm-ctp") {
+      conf.set("scache.ub.transport", options.ubTransport, slient = true)
+      if (options.ubTransport == "urpc") {
+        require(options.ubMode == "rc-rtp" && options.eidIndex == 0 && options.priority == 0,
+          "pinned URPC framework requires explicit rc-rtp/eid0/priority0")
+        require(options.ubPoolPath.nonEmpty && options.ipcPoolPath.nonEmpty, "URPC pool paths required")
+        conf.set("scache.ub.mode", "rc-rtp", slient = true)
+        conf.set("scache.ub.device", options.ubDevice, slient = true)
+        conf.set("scache.ub.eidIndex", "0", slient = true)
+        conf.set("scache.ub.priority", "0", slient = true)
+        conf.set("scache.ub.pool.enabled", "true", slient = true)
+        conf.set("scache.ub.pool.path", options.ubPoolPath, slient = true)
+        conf.set("spark.scache.strict", "true", slient = true)
+      } else if (options.ubMode == "rm-ctp") {
         require(options.ubDevice.nonEmpty, "--ub-device is required for RM/CTP")
         require(options.eidIndex >= 0, "--eid-index is required for RM/CTP")
         require(options.priority >= 0 && options.priority <= 15,
@@ -514,8 +527,8 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     case "--master-port" :: value :: tail => parseArgs(tail, options.copy(masterPort = value.toInt))
     case "--backend" :: value :: tail => parseArgs(tail, options.copy(backend = value.trim.toLowerCase))
     case "--ub-transport" :: value :: tail =>
-      require(value.trim.equalsIgnoreCase("real"), "--ub-transport must be real")
-      parseArgs(tail, options)
+      require(Set("real", "urpc")(value.trim.toLowerCase), "--ub-transport must be real or urpc")
+      parseArgs(tail, options.copy(ubTransport = value.trim.toLowerCase))
     case "--wire-role" :: value :: tail => parseArgs(tail, options.copy(wireRole = value.trim.toLowerCase))
     case "--wire-path" :: value :: tail => parseArgs(tail, options.copy(wirePath = value))
     case "--ub-control-port" :: value :: tail => parseArgs(tail, options.copy(ubControlPort = value.toInt))
