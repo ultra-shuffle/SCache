@@ -527,7 +527,7 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     case "--master-port" :: value :: tail => parseArgs(tail, options.copy(masterPort = value.toInt))
     case "--backend" :: value :: tail => parseArgs(tail, options.copy(backend = value.trim.toLowerCase))
     case "--ub-transport" :: value :: tail =>
-      require(Set("real", "urpc")(value.trim.toLowerCase), "--ub-transport must be real or urpc")
+      require(Set("real", "urpc", "umq")(value.trim.toLowerCase), "--ub-transport must be real, urpc or umq")
       parseArgs(tail, options.copy(ubTransport = value.trim.toLowerCase))
     case "--wire-role" :: value :: tail => parseArgs(tail, options.copy(wireRole = value.trim.toLowerCase))
     case "--wire-path" :: value :: tail => parseArgs(tail, options.copy(wirePath = value))

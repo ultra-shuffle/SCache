@@ -71,7 +71,7 @@ private[scache] class UBBlockTransferService(
     conf.getBoolean("scache.ub.checksum.enabled", true)
   private val transportBackend =
     UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
-  require(transportBackend == "real" || transportBackend == "urpc",
+  require(transportBackend == "real" || transportBackend == "urpc" || transportBackend == "umq",
     s"unsupported scache.ub.transport=$transportBackend; no implicit fallback")
   private val controlBindHost = conf.getString("spark.urma.controlBindHost", localHostName).trim
   // BlockManager registers BlockTransferService.hostName with the master. It must advertise the
@@ -963,7 +963,7 @@ private[scache] class UBBlockTransferService(
     // The experimental URPC backend has one blocking logical operation at a time.
     // Admit BEFORE acquiring the peer lease, not inside JNI after acquisition:
     // otherwise queued reads keep peer control channels idle until their timeout.
-    if (transportBackend == "urpc") {
+    if (transportBackend == "urpc" || transportBackend == "umq") {
       urpcTransferAdmission.synchronized { withControlAdmitted(host, remotePort)(body) }
     } else withControlAdmitted(host, remotePort)(body)
   }
@@ -1110,7 +1110,15 @@ private[scache] class UBBlockTransferService(
       "urpc.writeBytes" -> native.map(backend(_, "urpc.writeBytes")).getOrElse(0L),
       "urpc.stagingCopyBytes" -> native.map(backend(_, "urpc.stagingCopyBytes")).getOrElse(0L),
       "urpc.frameworkNative" -> native.map(backend(_, "urpc.frameworkNative")).getOrElse(0L),
-      "urpc.hardwareVerified" -> 0L)
+      "urpc.hardwareVerified" -> 0L,
+      "umq.rpcCalls" -> native.map(backend(_, "umq.rpcCalls")).getOrElse(0L),
+      "umq.rpcCompleted" -> native.map(backend(_, "umq.rpcCompleted")).getOrElse(0L),
+      "umq.rpcFailed" -> native.map(backend(_, "umq.rpcFailed")).getOrElse(0L),
+      "umq.readBytes" -> native.map(backend(_, "umq.readBytes")).getOrElse(0L),
+      "umq.writeBytes" -> native.map(backend(_, "umq.writeBytes")).getOrElse(0L),
+      "umq.stagingCopyBytes" -> native.map(backend(_, "umq.stagingCopyBytes")).getOrElse(0L),
+      "umq.libraryNative" -> native.map(backend(_, "umq.libraryNative")).getOrElse(0L),
+      "umq.hardwareVerified" -> 0L)
   }
 
   private def crc(buffer: ByteBuffer, length: Int): Long = UBBlockTransferService.crc(buffer, length)

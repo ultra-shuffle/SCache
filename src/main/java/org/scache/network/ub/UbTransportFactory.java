@@ -26,6 +26,7 @@ public final class UbTransportFactory {
     public static UbTransport open(String backend, String deviceName, int queueDepth,
                                    int maxChunkBytes, boolean strict, UrmaConnectionConfig config) {
         String selected = normalizeBackend(backend);
+        if ("umq".equals(selected)) return UmqUbTransport.open(deviceName, queueDepth, maxChunkBytes, config);
         if ("urpc".equals(selected)) return UrpcUbTransport.open(queueDepth, maxChunkBytes, config);
         if (!"real".equals(selected)) {
             throw new IllegalArgumentException("Unsupported production scache.ub.transport=" + selected);
