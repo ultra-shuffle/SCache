@@ -207,12 +207,13 @@ class Engine {
 public:
     Endpoint endpoint{};
     Engine(std::string eid,std::string ip,uint16_t port,std::string dir) {
-        std::promise<void> init; auto started=init.get_future();
-        io=std::thread([this,eid,ip,port,dir,&init] {
+        auto init=std::make_shared<std::promise<void>>();
+        auto started=init->get_future();
+        io=std::thread([this,eid,ip,port,dir,init] {
             try {
                 setup(eid,ip,port,dir);
                 urpc_qcfg_get_t q{}; check(urpc_queue_cfg_get(qh,&q)==0,"urpc_queue_cfg_get");
-                endpoint={q.qid,fid,port}; init.set_value();
+                endpoint={q.qid,fid,port}; init->set_value();
                 while(!stopping) {
                     std::function<void()> command;
                     { std::lock_guard<std::mutex> lock(mutex);
@@ -226,7 +227,7 @@ public:
                 try {std::rethrow_exception(fatal);}
                 catch(const std::exception& e){fprintf(stderr,"SCACHE_URPC_IO_FATAL %s\n",e.what());}
                 catch(...){fprintf(stderr,"SCACHE_URPC_IO_FATAL unknown\n");}
-                try {init.set_exception(fatal);} catch(...) {}
+                try {init->set_exception(fatal);} catch(...) {}
                 stopping=true;
             }
         });
