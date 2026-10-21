@@ -8,6 +8,7 @@ import java.nio.channels.FileChannel.MapMode
 import java.nio.file.StandardOpenOption
 import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, Semaphore, TimeoutException, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
 
 import org.apache.commons.httpclient.util.TimeoutController.TimeoutException
 import org.scache.deploy.DeployMessages._
@@ -26,7 +27,8 @@ import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutorService, Future, Promise}
 import scala.util.control.Exception
-import scala.util.{Failure, Random, Success}
+import scala.util.{Failure, Random, Success, Try}
+import scala.util.control.NonFatal
 
 
 /**
@@ -402,8 +404,9 @@ class ScacheClient(
         if (ubSharedPoolEnabled) {
           // Different blocks can make progress concurrently, but the semaphore bounds URMA and
           // arena/control pressure. Duplicate logical block ids are coalesced by single-flight.
-          Await.result(Future.traverse(blockIds)(blockId =>
-            ubPoolFetchSingleFlight(context, blockId)), Duration.Inf)
+          ScacheClient.awaitUbPoolBatch(blockIds,
+            blockId => ubPoolFetchSingleFlight(context, blockId),
+            blockId => { ubSharedTransport.get.releaseImportedPoolBlock(blockId); () })
         } else {
           blockIds.map { blockId =>
             getBlockIpcFromDaemon(context, blockId)
@@ -875,6 +878,10 @@ class ScacheClient(
             case None =>
           }
         } catch {
+          case e: org.scache.network.ub.UrmaDmaUnresolvedException =>
+            // The destination arena may still be provider-owned. Do not try another owner or
+            // turn this into a generic miss/fallback while the transport is quarantined.
+            throw e
           case e: Exception =>
             logWarning(s"UB shared pool fetch failed block=$blockId source=$location", e)
         }
@@ -985,25 +992,30 @@ class ScacheClient(
     // Reserve before joining a completed single-flight Future. The reservation transfers to
     // Spark's ManagedBuffer release callback; failed or missing fetches cancel it here.
     ub.reservePoolConsumer(blockId)
-    val promise = Promise[Option[IpcBlock]]()
-    val existing = ubPoolFetches.putIfAbsent(key, promise.future)
-    val shared =
-      if (existing != null) {
-        existing
-      } else {
-        Future {
-          ubPoolFetchSlots.acquire()
-          try getBlockIpcFromDaemon(context, blockId)
-          finally ubPoolFetchSlots.release()
-        }.onComplete { result =>
-          promise.tryComplete(result)
-          ubPoolFetches.remove(key, promise.future)
+    try {
+      val promise = Promise[Option[IpcBlock]]()
+      val existing = ubPoolFetches.putIfAbsent(key, promise.future)
+      val shared =
+        if (existing != null) {
+          existing
+        } else {
+          Future {
+            ScacheClient.acquireUbPoolSlot(ubPoolFetchSlots)
+            try getBlockIpcFromDaemon(context, blockId)
+            finally ubPoolFetchSlots.release()
+          }.onComplete { result =>
+            ScacheClient.finishUbPoolFetch(ubPoolFetches, key, promise, result)
+          }
+          promise.future
         }
-        promise.future
+      shared.andThen {
+        case Success(Some(IpcBlock(_, _: IpcPoolSlice))) =>
+        case _ => ub.cancelPoolConsumer(blockId)
       }
-    shared.andThen {
-      case Success(Some(_)) =>
-      case _ => ub.cancelPoolConsumer(blockId)
+    } catch {
+      case NonFatal(e) =>
+        ub.cancelPoolConsumer(blockId)
+        throw e
     }
   }
 
@@ -1025,6 +1037,92 @@ class ScacheClient(
 }
 
 object ScacheClient extends Logging{
+  /** Remove a completed single-flight entry before exposing its slice to any caller. Otherwise
+    * an immediately released final consumer can unpublish it while a new caller joins the stale
+    * completed Future and receives an already-recycled pool address.
+    */
+  private[deploy] def finishUbPoolFetch(
+      flights: ConcurrentHashMap[String, Future[Option[IpcBlock]]],
+      key: String,
+      promise: Promise[Option[IpcBlock]],
+      result: Try[Option[IpcBlock]]): Unit = {
+    flights.remove(key, promise.future)
+    promise.tryComplete(result)
+  }
+
+  /** An interrupt must complete the Future as a failure, not strand its Promise indefinitely. */
+  private[deploy] def acquireUbPoolSlot(slots: Semaphore): Unit = {
+    try slots.acquire()
+    catch {
+      case e: InterruptedException =>
+        Thread.currentThread().interrupt()
+        throw new IllegalStateException("UB pool fetch interrupted before slot acquisition", e)
+    }
+  }
+
+  /** Do not return a partial IPC batch while another submitted fetch still owns a pool slice. */
+  private[deploy] def awaitUbPoolBatch(
+      blockIds: Seq[BlockId],
+      fetch: BlockId => Future[Option[IpcBlock]],
+      release: BlockId => Unit)(implicit ec: ExecutionContext): Seq[Option[IpcBlock]] = {
+    // Start every fetch before waiting. A synchronous InterruptedException is excluded by
+    // scala.util.Try/NonFatal, so convert it into a settled failure and restore the flag only
+    // after all earlier requests have finished and their reservations have been returned.
+    val synchronousInterruption = new AtomicReference[InterruptedException]()
+    val outcomes = blockIds.map { blockId =>
+      val started = try {
+        val result = fetch(blockId)
+        if (result == null) throw new IllegalStateException("UB pool fetch returned a null Future")
+        result
+      } catch {
+        case e: InterruptedException =>
+          synchronousInterruption.compareAndSet(null, e)
+          Thread.interrupted()
+          Future.failed(new IllegalStateException("UB pool fetch interrupted during start", e))
+        case NonFatal(e) => Future.failed(e)
+      }
+      started.map[Try[Option[IpcBlock]]](Success(_))
+        .recover {
+          // A failed Future can carry InterruptedException even when this waiter thread was
+          // never interrupted. If it escapes Future.sequence, the wait loop below would catch
+          // it as a local interruption and retry the same failed Future forever.
+          case e: InterruptedException => Failure(e)
+          case NonFatal(e) => Failure(e)
+        }
+    }
+    val allSettled = Future.sequence(outcomes)
+    // Await.result is interruptible. Returning at that point would abandon successful children
+    // whose pool reservations have not yet been handed to Spark. Wait for every child to settle,
+    // then fail the interrupted batch and return all successful reservations before exiting.
+    var interruption: InterruptedException = synchronousInterruption.get()
+    var settled: Seq[Try[Option[IpcBlock]]] = null
+    while (settled == null) {
+      try settled = Await.result(allSettled, Duration.Inf)
+      catch {
+        case e: InterruptedException =>
+          if (interruption == null) interruption = e
+      }
+    }
+    val firstFailure: Option[Throwable] =
+      if (interruption != null) {
+        Some(new IllegalStateException("UB pool batch interrupted after requests started", interruption))
+      } else {
+        settled.collectFirst { case Failure(e) => e }
+      }
+    firstFailure match {
+      case Some(failure) =>
+        blockIds.zip(settled).foreach {
+          case (blockId, Success(Some(IpcBlock(_, _: IpcPoolSlice)))) =>
+            try release(blockId)
+            catch { case NonFatal(cleanup) => failure.addSuppressed(cleanup) }
+          case _ =>
+        }
+        if (interruption != null) Thread.currentThread().interrupt()
+        throw failure
+      case None => settled.map(_.get)
+    }
+  }
+
   def main(args: Array[String]): Unit = {
     val conf = new ScacheConf()
     val arguements = new ClientArguments(args, conf)

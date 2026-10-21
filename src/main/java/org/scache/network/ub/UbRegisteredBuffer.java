@@ -16,6 +16,7 @@ public final class UbRegisteredBuffer {
     public final long length;
     public final int token;
     public final long generation;
+    public final SegmentDescriptor segment;
 
     UbRegisteredBuffer(Object ownerIdentity, Object backendHandle, long handle, ByteBuffer buffer,
                        long remoteAddress, long length, int token) {
@@ -24,17 +25,23 @@ public final class UbRegisteredBuffer {
 
     UbRegisteredBuffer(Object ownerIdentity, Object backendHandle, long handle, long generation,
                        ByteBuffer buffer, long remoteAddress, long length, int token) {
+        this(ownerIdentity, backendHandle, handle, generation, buffer, remoteAddress, length, token, null);
+    }
+
+    UbRegisteredBuffer(Object ownerIdentity, Object backendHandle, long handle, long generation,
+                       ByteBuffer buffer, long remoteAddress, long length, int token, SegmentDescriptor segment) {
         this.ownerIdentity = Objects.requireNonNull(ownerIdentity, "ownerIdentity");
         this.backendHandle = backendHandle;
         if (handle <= 0) throw new IllegalArgumentException("handle must be positive");
         if (buffer == null || !buffer.isDirect()) {
             throw new IllegalArgumentException("registered buffer must be a DirectByteBuffer");
         }
-        if (remoteAddress < 0 || length <= 0 || length > buffer.capacity()) {
+        if (remoteAddress == 0 || length <= 0 || length > buffer.capacity()) {
             throw new IllegalArgumentException("invalid registered buffer descriptor");
         }
         this.handle = handle;
         this.generation = generation;
+        this.segment = segment;
         this.buffer = buffer;
         this.remoteAddress = remoteAddress;
         this.length = length;
@@ -55,6 +62,6 @@ public final class UbRegisteredBuffer {
 
     public RemoteBuffer descriptor() {
         if (!registered.get()) throw new IllegalStateException("buffer is unregistered");
-        return new RemoteBuffer(remoteAddress, length, token, generation);
+        return new RemoteBuffer(remoteAddress, length, token, generation, segment);
     }
 }

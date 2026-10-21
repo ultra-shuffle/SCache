@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SparkUrma: C++ URMA Transport with single owner-thread safety.
-// All URMA/provider/SystemC calls are serialized via internal mutex.
+// All URMA/provider calls are serialized via internal mutex.
 
 #ifndef SPARK_URMA_TRANSPORT_H
 #define SPARK_URMA_TRANSPORT_H
@@ -23,6 +23,7 @@
 
 struct urma_context;
 struct urma_jetty;
+struct urma_jfs;
 struct urma_jfc;
 struct urma_jfr;
 struct urma_target_seg;
@@ -30,6 +31,7 @@ struct urma_target_jetty;
 struct urma_token_id;
 typedef struct urma_context   urma_context_t;
 typedef struct urma_jetty     urma_jetty_t;
+typedef struct urma_jfs       urma_jfs_t;
 typedef struct urma_jfc       urma_jfc_t;
 typedef struct urma_jfr       urma_jfr_t;
 typedef struct urma_target_seg urma_target_seg_t;
@@ -98,15 +100,20 @@ public:
 private:
     uint64_t next_request_id();
 
-    // Lock that serializes ALL provider/SystemC calls
+    // Lock that serializes all provider calls
     mutable std::mutex owner_mutex_;
     std::thread::id owner_tid_;
+    void assert_owner_or_lock();
+
     // URMA handles
     urma_context_t* ctx_ = nullptr;
     urma_jetty_t* jetty_ = nullptr;
+    urma_jfs_t* jfs_ = nullptr;
     urma_jfc_t* jfc_ = nullptr;
     urma_jfr_t* jfr_ = nullptr;
+    urma_target_seg_t* local_seg_ = nullptr;
     urma_target_jetty_t* remote_jetty_ = nullptr;
+    bool remote_bound_ = false;
     struct ImportedRegionState {
         RemoteRegion region;
         urma_target_seg_t* segment = nullptr;
@@ -165,6 +172,9 @@ private:
     std::atomic<uint64_t> request_seq_{1};
     TransportMetrics metrics_;
 
+    void* local_buffer_ = nullptr;
+    size_t local_buffer_size_ = 0;
+
     uint64_t owner_epoch_ = 0;
     bool owns_runtime_slot_ = false;
 
@@ -172,14 +182,17 @@ private:
                                uint64_t address, uint64_t bytes);
     LocalRegionState& find_local_region_locked(const void* address, size_t length);
     ImportedRegionState& find_or_import_remote_locked(const RemoteRegion& remote);
+    void wait_for_post_capacity_locked(std::chrono::steady_clock::time_point deadline);
     uint64_t post_rw_locked(bool write_op, const RemoteRegion& remote,
                             void* local, size_t length, size_t remote_offset);
     void finalize_locked(RequestRecord& request, RequestState state, int status,
                          size_t completed_bytes, const std::string& message);
+    void fail_aggregate_locked(RequestRecord& request, const char* message) noexcept;
     void provider_drained_locked(RequestRecord& request);
     void poll_once_locked();
     void refresh_aggregates_locked();
     CompletionResult result_locked(const RequestRecord& request) const;
+    bool provider_owned_locked(const RequestRecord& request) const;
     void trim_terminal_cache_locked();
     void cleanup_locked(std::vector<std::string>& errors);
 };

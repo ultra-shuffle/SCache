@@ -2,7 +2,10 @@ name := "SCache"
 
 organization := "org.scache"
 
-scalaVersion := "2.13.18"
+// Spark 3.5.7 in this delivery uses Scala 2.13.8. SCache RPC serializes
+// Scala collections between executor and storage processes, so the patch
+// version must match even though both builds use the 2.13 binary ABI.
+scalaVersion := "2.13.8"
 
 lazy val Integration = config("integration") extend Test
 configs(Integration)
@@ -12,8 +15,8 @@ Integration / compile / javacOptions ~= (_.filterNot(_.startsWith("-Xplugin:sema
 Integration / packageBin / artifactPath :=
   (Compile / crossTarget).value / s"${name.value}-integration-${version.value}.jar"
 
-// Prefer local Maven cache (helps when working offline / in restricted-network environments).
-resolvers += Resolver.mavenLocal
+// This isolated build uses the pinned artifact cache. Maven Local may contain
+// incomplete artifacts from earlier builds and must not shadow valid releases.
 
 // Scaladoc may warn about unresolved @link targets (especially from Java sources).
 // Suppress those link warnings so `sbt doc` output is clean.

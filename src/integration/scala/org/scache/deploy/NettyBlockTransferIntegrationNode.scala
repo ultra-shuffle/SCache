@@ -4,11 +4,14 @@ import java.io.{BufferedReader, InputStreamReader, PrintWriter}
 import java.lang.management.ManagementFactory
 import java.net.{InetAddress, ServerSocket, Socket}
 import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import java.nio.file.{Files, Paths}
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.{Executors, TimeUnit}
 import java.util.zip.CRC32
 
 import org.scache.io.ChunkedByteBuffer
+import org.scache.deploy.DeployMessages.{IpcFile, IpcPoolSlice}
 import org.scache.network.netty.NettyBlockTransferService
 import org.scache.network.ub.UBBlockTransferService
 import org.scache.rpc.{RpcAddress, RpcEndpointAddress, RpcEnv}
@@ -39,6 +42,11 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       wirePath: String = "",
       ubControlPort: Int = 0,
       ubDevice: String = "",
+      ubMode: String = "",
+      eidIndex: Int = -1,
+      priority: Int = -1,
+      ubPoolPath: String = "",
+      ipcPoolPath: String = "",
       arenaBytes: Int = 0,
       arenaCount: Int = 2,
       queueDepth: Int = 128,
@@ -62,19 +70,48 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     conf.set("scache.driver.port", options.masterPort.toString, slient = true)
     conf.set("scache.app.id", s"integration-${options.backend}", slient = true)
     conf.set("scache.blockTransfer.backend", options.backend, slient = true)
+    if (options.ipcPoolPath.nonEmpty) {
+      conf.set("scache.daemon.ipc.backend", "pool", slient = true)
+      conf.set("scache.daemon.ipc.pool.path", options.ipcPoolPath, slient = true)
+      conf.set("scache.daemon.ipc.pool.size", "128m", slient = true)
+      conf.set("scache.daemon.ipc.pool.mapChunk", "64m", slient = true)
+    }
     if (options.backend == "ub") {
-      require(options.wireRole == "listen" || options.wireRole == "connect",
-        "--wire-role listen|connect is required for backend=ub")
-      require(options.wirePath.nonEmpty, "--wire-path is required for backend=ub")
       conf.set("spark.urma.strict", "true", slient = true)
-      conf.set("spark.urma.wireRole", options.wireRole, slient = true)
-      conf.set("spark.urma.wirePath", options.wirePath, slient = true)
+      if (options.ubMode == "rm-ctp") {
+        require(options.ubDevice.nonEmpty, "--ub-device is required for RM/CTP")
+        require(options.eidIndex >= 0, "--eid-index is required for RM/CTP")
+        require(options.priority >= 0 && options.priority <= 15,
+          "--priority must be in 0..15 for RM/CTP")
+        require(options.ubPoolPath.nonEmpty && options.ipcPoolPath.nonEmpty,
+          "--ub-pool-path and --ipc-pool-path are required for RM/CTP")
+        conf.set("scache.ub.mode", "rm-ctp", slient = true)
+        conf.set("scache.ub.device", options.ubDevice, slient = true)
+        conf.set("scache.ub.eidIndex", options.eidIndex.toString, slient = true)
+        conf.set("scache.ub.priority", options.priority.toString, slient = true)
+        conf.set("scache.ub.pool.enabled", "true", slient = true)
+        conf.set("scache.ub.pool.path", options.ubPoolPath, slient = true)
+        conf.set("spark.scache.strict", "true", slient = true)
+      } else {
+        require(options.wireRole == "listen" || options.wireRole == "connect",
+          "--wire-role listen|connect is required for legacy backend=ub")
+        require(options.wirePath.nonEmpty, "--wire-path is required for legacy backend=ub")
+        require(options.ubDevice.nonEmpty, "--ub-device is required for backend=ub")
+        conf.set("scache.ub.mode", "rc-rtp", slient = true)
+        conf.set("scache.ub.device", options.ubDevice, slient = true)
+        conf.set("scache.ub.eidIndex", "0", slient = true)
+        conf.set("scache.ub.priority", "0", slient = true)
+        conf.set("spark.urma.wireRole", options.wireRole, slient = true)
+        conf.set("spark.urma.wirePath", options.wirePath, slient = true)
+      }
       conf.set("spark.urma.controlBindHost", options.host, slient = true)
       conf.set("spark.urma.controlAdvertiseHost", options.host, slient = true)
       conf.set("spark.urma.controlPort", options.ubControlPort.toString, slient = true)
       conf.set("spark.urma.nodeId", options.name, slient = true)
       if (options.ubDevice.nonEmpty) {
-        conf.set(s"spark.urma.device.${options.wireRole}", options.ubDevice, slient = true)
+        if (options.ubMode != "rm-ctp") {
+          conf.set(s"spark.urma.device.${options.wireRole}", options.ubDevice, slient = true)
+        }
       }
       if (options.arenaBytes > 0) conf.set("spark.urma.arenaBytes", options.arenaBytes.toString, slient = true)
       conf.set("spark.urma.arenaCount", options.arenaCount.toString, slient = true)
@@ -104,6 +141,15 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     rpcEnv.setupEndpoint("ScacheClient", endpoint)
 
     awaitReady(endpoint, options.timeoutMs)
+    val daemon = if (options.ipcPoolPath.nonEmpty) {
+      val home = sys.env.getOrElse("SCACHE_HOME",
+        throw new IllegalStateException("SCACHE_HOME is required for pool IPC test"))
+      Some(new Daemon(home, s"integration-${options.backend}", DaemonEndpointConfig(
+        bindHost = Some(options.host),
+        clientHost = Some(options.host),
+        clientPort = Some(options.rpcPort),
+        correlationPrefix = s"pool-${options.name}")))
+    } else None
     val server = new ServerSocket(options.controlPort, 64, InetAddress.getByName(options.host))
     server.setSoTimeout(1000)
     val workers = Executors.newFixedThreadPool(16)
@@ -124,7 +170,7 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
         try {
           val socket = server.accept()
           workers.execute(new Runnable {
-            override def run(): Unit = handle(socket, endpoint, options)
+            override def run(): Unit = handle(socket, endpoint, daemon, options)
           })
         } catch {
           case _: java.net.SocketException if !running =>
@@ -136,6 +182,7 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       try server.close() catch { case NonFatal(_) => }
       workers.shutdown()
       workers.awaitTermination(10, TimeUnit.SECONDS)
+      daemon.foreach(_.stop())
       if (endpoint.blockManager != null) endpoint.blockManager.stop()
       rpcEnv.shutdown()
       rpcEnv.awaitTermination()
@@ -143,7 +190,11 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     }
   }
 
-  private def handle(socket: Socket, endpoint: ScacheClient, options: Options): Unit = {
+  private def handle(
+      socket: Socket,
+      endpoint: ScacheClient,
+      daemon: Option[Daemon],
+      options: Options): Unit = {
     try {
       socket.setSoTimeout(options.timeoutMs.toInt)
       val reader = new BufferedReader(new InputStreamReader(socket.getInputStream, "UTF-8"))
@@ -152,7 +203,7 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       if (line == null) return
       val parts = line.trim.split("\\s+").toList
       try {
-        writer.println(execute(parts, endpoint, options))
+        writer.println(execute(parts, endpoint, daemon, options))
       } catch {
         case NonFatal(e) =>
           // The integration launcher may deliberately use a minimal SCACHE_HOME with no log4j
@@ -167,7 +218,10 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
   }
 
   private def execute(
-      command: List[String], endpoint: ScacheClient, options: Options): String = command match {
+      command: List[String],
+      endpoint: ScacheClient,
+      daemon: Option[Daemon],
+      options: Options): String = command match {
     case "INFO" :: Nil =>
       val bmId = endpoint.blockManager.blockManagerId
       val conf = ScacheConf.getConf()
@@ -190,6 +244,71 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
       val stored = endpoint.blockManager.putBytes[Array[Byte]](
         blockId, new ChunkedByteBuffer(ByteBuffer.wrap(bytes)), StorageLevel.MEMORY_ONLY_SER)
       s"OK stored=$stored blockId=$id length=${bytes.length} crc=$crc"
+
+    case "POOLPUT" :: id :: size :: seed :: Nil =>
+      requireScacheBlock(id)
+      val localDaemon = daemon.getOrElse(
+        throw new IllegalStateException("pool IPC was not configured"))
+      val bytes = deterministicBytes(size.toInt, seed.toLong)
+      val stored = localDaemon.putBlocksPool(Array(id), Array(bytes)).head
+      if (!stored) throw new IllegalStateException(s"pool put failed for $id")
+      s"OK stored=true poolPut=true blockId=$id length=${bytes.length} crc=${crc32(bytes)}"
+
+    case "POOLFETCH" :: id :: size :: seed :: Nil =>
+      val blockId = requireScacheBlock(id)
+      val localDaemon = daemon.getOrElse(
+        throw new IllegalStateException("pool IPC was not configured"))
+      val localId = endpoint.blockManager.blockManagerId
+      val owners = endpoint.blockManager.master.getLocations(blockId)
+      if (!owners.exists(_ != localId)) {
+        throw new IllegalStateException(s"Master has no remote owner for $id: $owners")
+      }
+      endpoint.blockManager.getLocalBytes(blockId) match {
+        case Some(_) =>
+          endpoint.blockManager.releaseLock(blockId)
+          throw new IllegalStateException(s"consumer had a local block before pool fetch: $id")
+        case None =>
+      }
+      val expected = deterministicBytes(size.toInt, seed.toLong)
+      val started = System.nanoTime()
+      val ipcBlock = localDaemon.getBlockIpc(id).getOrElse(
+        throw new IllegalStateException(s"IPC block not found: $id"))
+      val actual = try {
+        ipcBlock.ipc match {
+          case slice: IpcPoolSlice =>
+            require(slice.length > 0 && slice.offset >= 0L && slice.poolPath.nonEmpty,
+              s"invalid pool slice for $id: $slice")
+            val channel = FileChannel.open(Paths.get(slice.poolPath), StandardOpenOption.READ)
+            try {
+              val buffer = ByteBuffer.allocate(slice.length)
+              var position = slice.offset
+              while (buffer.hasRemaining) {
+                val n = channel.read(buffer, position)
+                if (n <= 0) throw new IllegalStateException(s"short pool read for $id at $position")
+                position += n
+              }
+              buffer.array()
+            } finally channel.close()
+          case file: IpcFile =>
+            if (options.ubMode == "rm-ctp") {
+              throw new IllegalStateException(s"RM/CTP returned file IPC for $id")
+            }
+            try Files.readAllBytes(Paths.get(file.path))
+            finally Files.deleteIfExists(Paths.get(file.path))
+        }
+      } finally {
+        if (options.ubMode == "rm-ctp" && !localDaemon.releaseImportedBlock(id)) {
+          throw new IllegalStateException(s"RM/CTP imported pool release failed for $id")
+        }
+      }
+      if (ipcBlock.size != expected.length || !java.util.Arrays.equals(actual, expected)) {
+        throw new IllegalStateException(s"pool IPC payload mismatch for $id " +
+          s"expectedLength=${expected.length} actualLength=${actual.length} " +
+          s"expectedCrc=${crc32(expected)} actualCrc=${crc32(actual)}")
+      }
+      s"OK fetched=true masterRemoteOwner=true localMissBeforeFetch=true " +
+        s"poolIpc=${ipcBlock.ipc.getClass.getSimpleName} blockId=$id " +
+        s"length=${actual.length} crc=${crc32(actual)} elapsedNs=${System.nanoTime() - started}"
 
     case "LOCAL" :: id :: Nil =>
       val blockId = requireScacheBlock(id)
@@ -401,6 +520,11 @@ private[scache] object NettyBlockTransferIntegrationNode extends Logging {
     case "--wire-path" :: value :: tail => parseArgs(tail, options.copy(wirePath = value))
     case "--ub-control-port" :: value :: tail => parseArgs(tail, options.copy(ubControlPort = value.toInt))
     case "--ub-device" :: value :: tail => parseArgs(tail, options.copy(ubDevice = value))
+    case "--ub-mode" :: value :: tail => parseArgs(tail, options.copy(ubMode = value.trim.toLowerCase))
+    case "--eid-index" :: value :: tail => parseArgs(tail, options.copy(eidIndex = value.toInt))
+    case "--priority" :: value :: tail => parseArgs(tail, options.copy(priority = value.toInt))
+    case "--ub-pool-path" :: value :: tail => parseArgs(tail, options.copy(ubPoolPath = value))
+    case "--ipc-pool-path" :: value :: tail => parseArgs(tail, options.copy(ipcPoolPath = value))
     case "--arena-bytes" :: value :: tail => parseArgs(tail, options.copy(arenaBytes = value.toInt))
     case "--arena-count" :: value :: tail => parseArgs(tail, options.copy(arenaCount = value.toInt))
     case "--queue-depth" :: value :: tail => parseArgs(tail, options.copy(queueDepth = value.toInt))

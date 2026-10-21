@@ -192,13 +192,16 @@ int main() {
     require(!cleanup_errors.empty(), "cleanup rejects provider outstanding");
     transport.metrics_.provider_outstanding_requests.store(0);
 
-    // Bounded terminal cache remains safe beyond capacity.
+    // Terminal results are trimmed lazily before the next submission. Model
+    // that maintenance step after a burst of completions; finalize_locked()
+    // itself does not evict records while callers may still hold references.
     UrmaTransport cache_transport;
     for (uint64_t id = 1; id <= UrmaTransport::MAX_TERMINAL_RESULTS + 32; ++id) {
         cache_transport.requests_.emplace(id, request(id, 1));
         cache_transport.finalize_locked(cache_transport.requests_.at(id),
                                         RequestState::COMPLETED_SUCCESS, 0, 1, "");
     }
+    cache_transport.trim_terminal_cache_locked();
     require(cache_transport.terminal_order_.size() <= UrmaTransport::MAX_TERMINAL_RESULTS,
             "terminal order is bounded");
     require(cache_transport.requests_.size() <= UrmaTransport::MAX_TERMINAL_RESULTS,

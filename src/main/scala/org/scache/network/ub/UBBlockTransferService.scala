@@ -6,7 +6,7 @@
 package org.scache.network.ub
 
 import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream, EOFException, File}
-import java.net.{InetAddress, ServerSocket, Socket}
+import java.net.{InetAddress, InetSocketAddress, ServerSocket, Socket}
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.channels.FileChannel.MapMode
@@ -35,7 +35,7 @@ import org.scache.util.ScacheConf
  */
 private[scache] class UBBlockTransferService(
     conf: ScacheConf,
-    override val hostName: String,
+    localHostName: String,
     numCores: Int) extends BlockTransferService {
 
   import UBBlockTransferService._
@@ -73,9 +73,12 @@ private[scache] class UBBlockTransferService(
     UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
   require(transportBackend == "real",
     s"production SCache supports only scache.ub.transport=real; got $transportBackend")
-  private val deviceName = conf.getString("spark.urma.device", "").trim
-  private val controlBindHost = conf.getString("spark.urma.controlBindHost", hostName).trim
-  private val controlAdvertiseHost = conf.getString("spark.urma.controlAdvertiseHost", hostName).trim
+  private val controlBindHost = conf.getString("spark.urma.controlBindHost", localHostName).trim
+  // BlockManager registers BlockTransferService.hostName with the master. It must advertise the
+  // same reachable address as the UB control listener, not the local bind/default hostname.
+  override val hostName: String =
+    conf.getString("spark.urma.controlAdvertiseHost", localHostName).trim
+  private val controlAdvertiseHost = hostName
   private val nodeId = conf.getString("spark.urma.nodeId", s"$hostName-${UUID.randomUUID}")
   private val epoch = System.nanoTime()
   private val controlBytes = new AtomicLong(0L)
@@ -105,6 +108,8 @@ private[scache] class UBBlockTransferService(
   private val traceEvents = new AtomicLong(0L)
 
   @volatile private var closed = false
+  @volatile private var dmaUnresolved = false
+  private var closeCompleted = false
   @volatile private var dataManager: BlockDataManager = _
   @volatile private var transport: UbTransport = _
   @volatile private var arena: RegisteredArenaPool = _
@@ -118,20 +123,46 @@ private[scache] class UBBlockTransferService(
   // payloads. Keep their ids so application cleanup can retire only imported slices; owner blocks
   // are retired through BlockManager.removeBlock/unpublishBlock.
   private val importedSharedBlocks = mutable.HashSet.empty[String]
+  // A fetch may have acquired a source lease but not yet published its destination when
+  // removeShuffle scans importedSharedBlocks. Remember retired namespaces so that such a
+  // late fetch cannot publish a slice after shuffle cleanup has already passed it.
+  private val retiredShuffles = mutable.HashSet.empty[(String, Int, Int)]
+  private val retiredApplications = mutable.HashSet.empty[String]
   // A destination can be returned to multiple Spark task attempts. Keep it published until the
   // final ManagedBuffer consumer releases it; otherwise an arena reuse can corrupt decompression.
   private val sharedPoolConsumerRefs = mutable.HashMap.empty[String, Int]
 
+  private def rejectRetiredPoolBlock(blockId: String): Unit = {
+    val retired = try {
+      BlockId(blockId) match {
+        case ScacheBlockId(app, job, shuffle, _, _) =>
+          retiredApplications.contains("") || retiredApplications.contains(app) ||
+          retiredShuffles.exists { case (retiredApp, retiredShuffle, retiredJob) =>
+            (retiredApp == null || retiredApp.isEmpty || retiredApp == app) &&
+              retiredShuffle == shuffle && (retiredJob < 0 || retiredJob == job)
+          }
+        case _ => false
+      }
+    } catch { case NonFatal(_) => false }
+    if (retired) throw new IllegalStateException(s"UB shuffle retired before pool fetch block=$blockId")
+  }
+
   override def init(blockDataManager: BlockDataManager): Unit = {
     require(controlBindHost.nonEmpty && controlAdvertiseHost.nonEmpty,
       "UB control bind and advertise hosts must be explicit")
-    require(deviceName.nonEmpty,
-      "spark.urma.device must name a device reported by the installed URMA provider")
+    require(timeoutMs > 0, "spark.urma.transferTimeoutMs must be positive")
+    val device = conf.getString("scache.ub.device", "").trim
+    require(device.nonEmpty, "scache.ub.device must name a confirmed hardware device")
+    val connection = new UrmaConnectionConfig(
+      conf.getString("scache.ub.mode", "").trim,
+      conf.getInt("scache.ub.eidIndex", -1),
+      conf.getInt("scache.ub.priority", -1), timeoutMs,
+      conf.getInt("scache.ub.drainTimeoutMs", 5000))
     try {
       dataManager = blockDataManager
-      transport = UbTransportFactory.open(transportBackend, deviceName,
-        conf.getInt("spark.urma.queueDepth", 128),
-        conf.getInt("spark.urma.chunkSize", 10 * 1024 * 1024), strictMode)
+      transport = UbTransportFactory.open(transportBackend, device,
+        conf.getInt("spark.urma.queueDepth", 128), conf.getInt("spark.urma.chunkSize", 4096),
+        strictMode, connection)
       require(arenaCount > 0, "spark.urma.arenaCount must be positive")
       if (sharedPoolEnabled) {
         require(sharedPoolDirectory.nonEmpty,
@@ -148,12 +179,13 @@ private[scache] class UBBlockTransferService(
       acceptThread = new Thread(() => acceptLoop(), s"ub-control-$nodeId")
       acceptThread.setDaemon(true)
       acceptThread.start()
-      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch backend=$transportBackend " +
-        s"device=$deviceName control=$controlAdvertiseHost:${server.getLocalPort} " +
+      summary(s"UB BlockTransferService ready node=$nodeId epoch=$epoch backend=$transportBackend mode=${connection.mode} " +
+        s"device=$device eidIndex=${connection.eidIndex} priority=${connection.priority} " +
+        s"control=$controlAdvertiseHost:${server.getLocalPort} " +
           s"arenaBytes=${arena.capacity} arenas=${arena.arenaCount}")
     } catch {
       case NonFatal(e) =>
-        close()
+        try close() catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
         if (strictMode) throw new RuntimeException("URMA strict initialization failed", e)
         throw new RuntimeException("UB backend does not provide a Netty fallback", e)
     }
@@ -164,7 +196,10 @@ private[scache] class UBBlockTransferService(
   /** Called by BlockManager only after its normal put path has succeeded. */
   private[scache] def publishBlock(blockId: BlockId, bytes: Array[Byte]): Unit = {
     requireReady()
-    arena.publish(blockId.toString, bytes)
+    importedSharedBlocks.synchronized {
+      rejectRetiredPoolBlock(blockId.toString)
+      arena.publish(blockId.toString, bytes)
+    }
     trace(s"SCACHE_UB_PUBLISH nodeId=$nodeId nodeEpoch=$epoch blockId=$blockId " +
       s"length=${bytes.length} crc=${crc(ByteBuffer.wrap(bytes), bytes.length)} terminal=SUCCESS")
   }
@@ -178,7 +213,11 @@ private[scache] class UBBlockTransferService(
       blockId: BlockId, size: Int): Option[PoolSlice] = {
     requireReady()
     if (!sharedPoolEnabled) return None
-    val slice = arena.prepareShared(blockId.toString, size)
+    val slice = importedSharedBlocks.synchronized {
+      rejectRetiredPoolBlock(blockId.toString)
+      rejectActivePoolConsumers(blockId.toString)
+      arena.prepareShared(blockId.toString, size)
+    }
     sharedPoolPrepares.incrementAndGet()
     Some(slice)
   }
@@ -191,7 +230,11 @@ private[scache] class UBBlockTransferService(
     val prepared = mutable.ArrayBuffer.empty[(BlockId, PoolSlice)]
     try {
       blockIds.zip(sizes).map { case (blockId, size) =>
-        val slice = arena.prepareShared(blockId.toString, size)
+        val slice = importedSharedBlocks.synchronized {
+          rejectRetiredPoolBlock(blockId.toString)
+          rejectActivePoolConsumers(blockId.toString)
+          arena.prepareShared(blockId.toString, size)
+        }
         sharedPoolPrepares.incrementAndGet()
         prepared += ((blockId, slice))
         Some(slice)
@@ -211,7 +254,10 @@ private[scache] class UBBlockTransferService(
       blockId: BlockId, poolPath: String, offset: Long, size: Int): Boolean = {
     requireReady()
     if (!sharedPoolEnabled) return false
-    val committed = arena.commitShared(blockId.toString, poolPath, offset, size)
+    val committed = importedSharedBlocks.synchronized {
+      rejectRetiredPoolBlock(blockId.toString)
+      arena.commitShared(blockId.toString, poolPath, offset, size)
+    }
     if (committed) sharedPoolCommits.incrementAndGet()
     committed
   }
@@ -226,20 +272,24 @@ private[scache] class UBBlockTransferService(
       blockId: BlockId, poolPath: String, offset: Long, size: Int): Boolean = {
     requireReady()
     if (!sharedPoolEnabled) return false
-    val published = arena.localShared(blockId.toString).exists { slice =>
-      slice.path == poolPath && slice.offset == offset && slice.length == size
-    }
-    if (published) {
-      // A cancelled Spark task can race an asynchronous COMMIT.  Treat the abort as a revoke in
-      // that case so a late commit cannot leave an unreachable published slice behind.
-      arena.unpublish(blockId.toString, unpublishTimeoutMs)
-      sharedPoolAborts.incrementAndGet()
-      return true
-    }
-    arena.abortShared(blockId.toString, poolPath, offset, size)
-    sharedPoolAborts.incrementAndGet()
-    !arena.localShared(blockId.toString).exists { slice =>
-      slice.offset == offset && slice.length == size
+    importedSharedBlocks.synchronized {
+      val published = arena.localShared(blockId.toString).exists { slice =>
+        slice.path == poolPath && slice.offset == offset && slice.length == size
+      }
+      if (published) {
+        // A cancelled Spark task can race an asynchronous COMMIT.  Do not revoke
+        // a slice already handed to a local Spark reader.
+        rejectActivePoolConsumers(blockId.toString)
+        arena.unpublish(blockId.toString, unpublishTimeoutMs)
+        sharedPoolAborts.incrementAndGet()
+        true
+      } else {
+        arena.abortShared(blockId.toString, poolPath, offset, size)
+        sharedPoolAborts.incrementAndGet()
+        !arena.localShared(blockId.toString).exists { slice =>
+          slice.offset == offset && slice.length == size
+        }
+      }
     }
   }
 
@@ -260,6 +310,7 @@ private[scache] class UBBlockTransferService(
       host: String, remotePort: Int, blockId: String): Option[PoolSlice] = {
     requireReady()
     if (!sharedPoolEnabled) return None
+    importedSharedBlocks.synchronized { rejectRetiredPoolBlock(blockId) }
     localPoolBlock(BlockId(blockId)) match {
       case Some(local) => return Some(local)
       case None =>
@@ -267,21 +318,25 @@ private[scache] class UBBlockTransferService(
     withControl(host, remotePort) { (channel, peer) =>
       channel.exchange(Acquire(blockId)) match {
         case Grant(descriptor) =>
-          validateDescriptor(descriptor, peer, blockId)
-          val destination = arena.prepareShared(blockId, descriptor.length, ownerPeer = "remote-fetch")
-          val buffer = arena.sharedBuffer(blockId)
-          sharedPoolDestinationReads.incrementAndGet()
-          sharedPoolDestinationBytes.addAndGet(descriptor.length.toLong)
-          if (destination.length != descriptor.length || !buffer.isDirect ||
-              buffer.capacity() < descriptor.length) {
-            sharedPoolDestinationIdentityMismatches.incrementAndGet()
-            throw new IllegalStateException(
-              "UB shared destination identity mismatch block=" + blockId +
-                " length=" + descriptor.length + " sliceLength=" + destination.length +
-                " direct=" + buffer.isDirect + " capacity=" + buffer.capacity())
-          }
-          sharedPoolDestinationIdentityMatches.incrementAndGet()
+          var prepared: Option[PoolSlice] = None
           try {
+            // The source lease already exists at GRANT. Validation failures
+            // occur before DMA and must still run the RELEASE cleanup below.
+            validateDescriptor(descriptor, peer, blockId)
+            val destination = arena.prepareShared(blockId, descriptor.length, ownerPeer = "remote-fetch")
+            prepared = Some(destination)
+            val buffer = arena.sharedBuffer(blockId)
+            sharedPoolDestinationReads.incrementAndGet()
+            sharedPoolDestinationBytes.addAndGet(descriptor.length.toLong)
+            if (destination.length != descriptor.length || !buffer.isDirect ||
+                buffer.capacity() < descriptor.length) {
+              sharedPoolDestinationIdentityMismatches.incrementAndGet()
+              throw new IllegalStateException(
+                "UB shared destination identity mismatch block=" + blockId +
+                  " length=" + descriptor.length + " sliceLength=" + destination.length +
+                  " direct=" + buffer.isDirect + " capacity=" + buffer.capacity())
+            }
+            sharedPoolDestinationIdentityMatches.incrementAndGet()
             transferRead(descriptor, buffer, s"pool-fetch-$blockId", blockId)
             val actual = if (sharedPoolChecksumEnabled) crc(buffer, descriptor.length) else -1L
             if (sharedPoolChecksumEnabled && actual != descriptor.crc) {
@@ -289,23 +344,35 @@ private[scache] class UBBlockTransferService(
               throw new IllegalStateException(
                 s"CRC mismatch for shared UB pool fetch block=$blockId expected=${descriptor.crc} actual=$actual")
             }
-            if (!arena.commitShared(blockId, destination.path, destination.offset,
-                destination.length, ownerPeer = "remote-fetch", expectedCrc = actual)) {
-              throw new IllegalStateException(s"failed to publish shared UB destination for $blockId")
-            }
-            importedSharedBlocks.synchronized { importedSharedBlocks += blockId }
-            sharedPoolImports.incrementAndGet()
+            // A failed RELEASE response must not leave a published destination
+            // that no caller received. The read and checksum are already
+            // complete, so the source lease can safely be released first.
             channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
-              case Ack =>
-                Some(destination)
+              case Ack => ()
               case other => throw new IllegalStateException(s"remote UB RELEASE failed: $other")
             }
+            importedSharedBlocks.synchronized {
+              rejectRetiredPoolBlock(blockId)
+              if (!arena.commitShared(blockId, destination.path, destination.offset,
+                  destination.length, ownerPeer = "remote-fetch", expectedCrc = actual)) {
+                throw new IllegalStateException(s"failed to publish shared UB destination for $blockId")
+              }
+              importedSharedBlocks += blockId
+            }
+            sharedPoolImports.incrementAndGet()
+            Some(destination)
           } catch {
             case NonFatal(e) =>
-              arena.abortShared(blockId, destination.path, destination.offset, destination.length,
-                ownerPeer = "remote-fetch")
-              try channel.exchange(Release(descriptor.leaseId, descriptor.generation))
-              catch { case NonFatal(_) => }
+              if (!dmaUnresolved) {
+                // ACQUIRE already granted a source lease even if local allocation failed.
+                // Cleanup failures must not skip its RELEASE or replace the original error.
+                try prepared.foreach { destination =>
+                  arena.abortShared(blockId, destination.path, destination.offset, destination.length,
+                    ownerPeer = "remote-fetch")
+                } catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+                try channel.exchange(Release(descriptor.leaseId, descriptor.generation))
+                catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+              }
               throw e
           }
         case NotFound => None
@@ -322,6 +389,7 @@ private[scache] class UBBlockTransferService(
     require(blockId != null, "UB pool consumer blockId must not be null")
     val name = blockId.toString
     importedSharedBlocks.synchronized {
+      rejectRetiredPoolBlock(name)
       val previous = sharedPoolConsumerRefs.getOrElse(name, 0)
       sharedPoolConsumerRefs.update(name, previous + 1)
       sharedPoolConsumerReservations.incrementAndGet()
@@ -344,10 +412,22 @@ private[scache] class UBBlockTransferService(
   /** Called by BlockManager before memory/disk removal, so no stale descriptor survives it. */
   private[scache] def unpublishBlock(blockId: BlockId): Unit = {
     importedSharedBlocks.synchronized {
+      // Keep ownership bookkeeping if a live remote lease prevents retirement.
+      // Use the same metadata -> arena lock order as releaseImportedPoolBlock.
+      rejectActivePoolConsumers(blockId.toString)
+      if (arena != null) arena.unpublish(blockId.toString, unpublishTimeoutMs)
       importedSharedBlocks -= blockId.toString
       sharedPoolConsumerRefs -= blockId.toString
     }
-    if (arena != null) arena.unpublish(blockId.toString, unpublishTimeoutMs)
+  }
+
+  /** The same mmap slice must not be replaced while a local Spark reader owns it. */
+  private def rejectActivePoolConsumers(blockId: String): Unit = {
+    val refs = sharedPoolConsumerRefs.getOrElse(blockId, 0)
+    if (refs > 0) {
+      throw new IllegalStateException(
+        s"cannot retire UB shared block $blockId while $refs local consumers are active")
+    }
   }
 
   /**
@@ -396,8 +476,22 @@ private[scache] class UBBlockTransferService(
    * Application-release hook: all Spark/SCache leases must already be drained.
    * This releases cached peer MR imports without restarting the client or transport.
    */
+  /** Full import drain for explicit test shutdown; application cleanup uses the scoped form. */
   private[scache] def releaseCachedRemoteImports(): Unit =
     releaseCachedRemoteImportsWhere(_ => true)
+
+  private[scache] def releaseCachedRemoteImportsForApplication(appName: String): Unit = {
+    val app = Option(appName).getOrElse("")
+    retireApplicationNamespace(app)
+    releaseCachedRemoteImportsWhere { blockName =>
+      try {
+        BlockId(blockName) match {
+          case ScacheBlockId(ownerApp, _, _, _, _) => app.isEmpty || ownerApp == app
+          case _ => false
+        }
+      } catch { case NonFatal(_) => false }
+    }
+  }
 
   /**
    * Shuffle-scoped cleanup for imported destination slices.  The old application-wide hook is
@@ -407,6 +501,7 @@ private[scache] class UBBlockTransferService(
    */
   private[scache] def releaseCachedRemoteImportsForShuffle(
       appName: String, shuffleId: Int, jobId: Int): Unit = {
+    retireShuffleNamespace(appName, shuffleId, jobId)
     releaseCachedRemoteImportsWhere { blockName =>
       try {
         BlockId(blockName) match {
@@ -421,27 +516,48 @@ private[scache] class UBBlockTransferService(
     }
   }
 
+  /** Stop late producer commits and reducer imports before BlockManager scans stored blocks. */
+  private[scache] def retireShuffleNamespace(appName: String, shuffleId: Int, jobId: Int): Unit =
+    importedSharedBlocks.synchronized {
+      retiredShuffles += ((appName, shuffleId, jobId))
+    }
+
+  private[scache] def retireApplicationNamespace(appName: String): Unit =
+    importedSharedBlocks.synchronized {
+      retiredApplications += Option(appName).getOrElse("")
+    }
+
   private def releaseCachedRemoteImportsWhere(predicate: String => Boolean): Unit = {
     if (arena == null) return
+    val cleanupFailures = mutable.ArrayBuffer.empty[Throwable]
     val candidates = importedSharedBlocks.synchronized {
       importedSharedBlocks.toVector.filter(predicate)
     }
     candidates.foreach { blockId =>
       try {
-        arena.unpublish(blockId, unpublishTimeoutMs)
         importedSharedBlocks.synchronized {
+          rejectActivePoolConsumers(blockId)
+          arena.unpublish(blockId, unpublishTimeoutMs)
           importedSharedBlocks -= blockId
           sharedPoolConsumerRefs -= blockId
         }
       } catch {
         case NonFatal(e) =>
           summary(s"UB imported slice cleanup failed block=$blockId: ${e.getMessage}")
+          cleanupFailures += new IllegalStateException(
+            s"UB imported slice cleanup failed block=$blockId", e)
       }
     }
     val noImportedSlices = importedSharedBlocks.synchronized(importedSharedBlocks.isEmpty)
     if (noImportedSlices && transport != null) {
       transport.releaseCachedRemoteImports()
       trace(s"SCACHE_UB_REMOTE_IMPORTS_RELEASED nodeId=$nodeId nodeEpoch=$epoch")
+    }
+    if (strictMode && cleanupFailures.nonEmpty) {
+      val failure = new IllegalStateException(
+        s"strict UB cleanup left ${cleanupFailures.size} imported slice(s) active")
+      cleanupFailures.foreach(failure.addSuppressed)
+      throw failure
     }
   }
 
@@ -450,13 +566,20 @@ private[scache] class UBBlockTransferService(
     withControl(host, remotePort) { (channel, peer) =>
       channel.exchange(Acquire(blockId)) match {
         case Grant(descriptor) =>
-          validateDescriptor(descriptor, peer, blockId)
-          channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
-            case Ack =>
-              s"producerNodeId=${descriptor.nodeId} producerEpoch=${descriptor.epoch} arenaId=${descriptor.arenaId} " +
-                s"offset=${descriptor.offset} length=${descriptor.length} token=${descriptor.token} " +
-                s"generation=${descriptor.generation} leaseId=${descriptor.leaseId}"
-            case other => throw new IllegalStateException(s"probe RELEASE failed: $other")
+          try {
+            validateDescriptor(descriptor, peer, blockId)
+            channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
+              case Ack =>
+                s"producerNodeId=${descriptor.nodeId} producerEpoch=${descriptor.epoch} arenaId=${descriptor.arenaId} " +
+                  s"offset=${descriptor.offset} length=${descriptor.length} token=${descriptor.token} " +
+                  s"generation=${descriptor.generation} leaseId=${descriptor.leaseId}"
+              case other => throw new IllegalStateException(s"probe RELEASE failed: $other")
+            }
+          } catch {
+            case NonFatal(e) =>
+              try channel.exchange(Release(descriptor.leaseId, descriptor.generation))
+              catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+              throw e
           }
         case other => throw new IllegalStateException(s"probe ACQUIRE failed: $other")
       }
@@ -509,20 +632,23 @@ private[scache] class UBBlockTransferService(
         case "remote_bounds" | "invalid_token" =>
           channel.exchange(Acquire(blockId)) match {
             case Grant(d) =>
-              val localArena = arena
-              val local = localArena.allocateScratch(math.max(1, d.length))
+              validateDescriptor(d, peer, blockId)
               try {
                 var rejected = false
                 try {
-                  val remote = if (caseId == "remote_bounds")
-                    new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong - 1L), d.token, d.segmentGeneration)
-                  else new RemoteBuffer(d.remoteAddress, math.max(1L, d.length.toLong), d.token + 1, d.segmentGeneration)
-                  val request = transport.read(remote, 0L, local.buffer, 0, math.max(1, d.length))
-                  rejected = transport.waitFor(request, timeoutMs) != 0
-                } catch { case NonFatal(_) => rejected = true }
+                  // Local descriptor checks only: do not claim a provider
+                  // fault was tested when the malformed request never posts.
+                  if (caseId == "remote_bounds")
+                    RealUbTransport.window(d.remote, d.length.toLong + 1L, 1)
+                  else new RemoteBuffer(d.remoteAddress, d.length.toLong,
+                    d.token ^ 1, d.segmentGeneration, d.segment)
+                } catch {
+                  case _: UrmaProtocolException => rejected = caseId == "invalid_token"
+                  case e: UrmaException => rejected = caseId == "remote_bounds" &&
+                    e.getMessage == "remote offset/length exceeds descriptor"
+                }
                 if (!rejected) throw new IllegalStateException(s"$caseId descriptor was accepted")
               } finally {
-                localArena.freeScratch(local)
                 channel.exchange(Release(d.leaseId, d.generation))
               }
             case other => throw new IllegalStateException(s"ACQUIRE failed: $other")
@@ -584,37 +710,46 @@ private[scache] class UBBlockTransferService(
       val acquireRequestId = channel.lastExchangeId
       acquireResult match {
         case Grant(descriptor) =>
-          validateDescriptor(descriptor, peer, blockId)
-          trace(s"SCACHE_UB_DESCRIPTOR transferId=$transferId controlRequestId=$acquireRequestId " +
-            s"blockId=$blockId producerNodeId=${descriptor.nodeId} producerEpoch=${descriptor.epoch} " +
-            s"consumerNodeId=$nodeId consumerEpoch=$epoch arenaId=${descriptor.arenaId} " +
-            s"baseAddress=${descriptor.baseAddress} offset=${descriptor.offset} remoteAddress=${descriptor.remoteAddress} " +
-            s"length=${descriptor.length} token=${descriptor.token} generation=${descriptor.generation} " +
-            s"crc=${descriptor.crc} leaseId=${descriptor.leaseId} leaseOwner=$nodeId/$epoch " +
-            s"leaseTimeoutMs=$leaseTimeoutMs terminal=GRANT")
           val localArena = arena
-          val local = localArena.allocateScratch(descriptor.length)
           try {
-            transferRead(descriptor, local.buffer, transferId, blockId)
-            val actual = if (sharedPoolChecksumEnabled) crc(local.buffer, descriptor.length) else -1L
-            if (sharedPoolChecksumEnabled && actual != descriptor.crc) {
-              checksumErrors.incrementAndGet()
-              throw new IllegalStateException(s"CRC mismatch for $blockId expected=${descriptor.crc} actual=$actual")
+            validateDescriptor(descriptor, peer, blockId)
+            trace(s"SCACHE_UB_DESCRIPTOR transferId=$transferId controlRequestId=$acquireRequestId " +
+              s"blockId=$blockId producerNodeId=${descriptor.nodeId} producerEpoch=${descriptor.epoch} " +
+              s"consumerNodeId=$nodeId consumerEpoch=$epoch arenaId=${descriptor.arenaId} " +
+              s"baseAddress=${descriptor.baseAddress} offset=${descriptor.offset} remoteAddress=${descriptor.remoteAddress} " +
+              s"length=${descriptor.length} token=${descriptor.token} generation=${descriptor.generation} " +
+              s"crc=${descriptor.crc} leaseId=${descriptor.leaseId} leaseOwner=$nodeId/$epoch " +
+              s"leaseTimeoutMs=$leaseTimeoutMs terminal=GRANT")
+            val local = localArena.allocateScratch(descriptor.length)
+            try {
+              transferRead(descriptor, local.buffer, transferId, blockId)
+              val actual = if (sharedPoolChecksumEnabled) crc(local.buffer, descriptor.length) else -1L
+              if (sharedPoolChecksumEnabled && actual != descriptor.crc) {
+                checksumErrors.incrementAndGet()
+                throw new IllegalStateException(s"CRC mismatch for $blockId expected=${descriptor.crc} actual=$actual")
+              }
+              val copied = ByteBuffer.allocate(descriptor.length)
+              val source = local.buffer.duplicate(); source.position(0); source.limit(descriptor.length)
+              copied.put(source); copied.flip()
+              channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
+                case Ack =>
+                  trace(s"SCACHE_UB_FETCH_TERMINAL transferId=$transferId controlRequestId=${channel.lastExchangeId} " +
+                    s"blockId=$blockId length=${descriptor.length} expectedCrc=${descriptor.crc} actualCrc=$actual " +
+                    s"leaseId=${descriptor.leaseId} generation=${descriptor.generation} terminal=SUCCESS")
+                  new NioManagedBuffer(copied)
+                case ErrorResponse(message) => throw new IllegalStateException(message)
+                case other => throw new IllegalStateException(s"unexpected RELEASE response $other")
+              }
+            } finally {
+              if (!dmaUnresolved) localArena.freeScratch(local)
             }
-            val copied = ByteBuffer.allocate(descriptor.length)
-            val source = local.buffer.duplicate(); source.position(0); source.limit(descriptor.length)
-            copied.put(source); copied.flip()
-            channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
-              case Ack =>
-                trace(s"SCACHE_UB_FETCH_TERMINAL transferId=$transferId controlRequestId=${channel.lastExchangeId} " +
-                  s"blockId=$blockId length=${descriptor.length} expectedCrc=${descriptor.crc} actualCrc=$actual " +
-                  s"leaseId=${descriptor.leaseId} generation=${descriptor.generation} terminal=SUCCESS")
-                new NioManagedBuffer(copied)
-              case ErrorResponse(message) => throw new IllegalStateException(message)
-              case other => throw new IllegalStateException(s"unexpected RELEASE response $other")
-            }
-          } finally {
-            localArena.freeScratch(local)
+          } catch {
+            case NonFatal(e) =>
+              if (!dmaUnresolved) {
+                try channel.exchange(Release(descriptor.leaseId, descriptor.generation))
+                catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+              }
+              throw e
           }
         case NotFound => throw new java.io.FileNotFoundException(s"remote UB block $blockId was not published")
         case Stale => generationErrors.incrementAndGet(); throw new IllegalStateException(s"stale UB descriptor for $blockId")
@@ -644,8 +779,8 @@ private[scache] class UBBlockTransferService(
             if (sharedPoolChecksumEnabled) crc(source.buffer, sourceBytes.length) else -1L,
             level.toInt, level.replication, classTag.runtimeClass.getName)) match {
             case Grant(descriptor) =>
-              validateDescriptor(descriptor, peer, blockId.toString)
               try {
+                validateDescriptor(descriptor, peer, blockId.toString)
                 transferWrite(descriptor, source.buffer, sourceBytes.length)
                 channel.exchange(Commit(descriptor.leaseId, descriptor.generation)) match {
                   case Ack => ()
@@ -654,15 +789,17 @@ private[scache] class UBBlockTransferService(
                 }
               } catch {
                 case NonFatal(e) =>
-                  try { channel.exchange(Abort(descriptor.leaseId, descriptor.generation)) }
-                  catch { case NonFatal(_) => }
+                  if (!dmaUnresolved) {
+                    try { channel.exchange(Abort(descriptor.leaseId, descriptor.generation)) }
+                    catch { case NonFatal(_) => }
+                  }
                   throw e
               }
             case ErrorResponse(message) => throw new IllegalStateException(message)
             case other => throw new IllegalStateException(s"unexpected PREPARE response $other")
           }
         }
-      } finally localArena.freeScratch(source)
+      } finally { if (!dmaUnresolved) localArena.freeScratch(source) }
     }
   }
 
@@ -671,10 +808,10 @@ private[scache] class UBBlockTransferService(
       descriptor: Descriptor, destination: ByteBuffer, transferId: String, blockId: String): Unit = {
     transferLogical(descriptor.length) { (offset, length, index, count) =>
       val request = transport.read(descriptor.remote, offset.toLong, destination, offset, length)
+      await(request, length, isRead = true)
       trace(s"SCACHE_UB_LOGICAL_READ transferId=$transferId blockId=$blockId " +
         s"requestId=$request operationIndex=$index operationCount=$count offset=$offset " +
-        s"length=$length terminal=SUBMITTED")
-      await(request, length, isRead = true)
+        s"length=$length terminal=SUCCESS")
     }
   }
 
@@ -696,7 +833,12 @@ private[scache] class UBBlockTransferService(
     var index = 0
     while (offset < blockLength) {
       val length = math.min(logicalLimit, blockLength - offset)
-      operation(offset, length, index, operationCount)
+      try operation(offset, length, index, operationCount)
+      catch {
+        case e: UrmaDmaUnresolvedException =>
+          quarantineUnresolvedDma()
+          throw e
+      }
       offset = Math.addExact(offset, length)
       index += 1
     }
@@ -712,8 +854,20 @@ private[scache] class UBBlockTransferService(
       val rawOperationBytes = transport.capabilities().maxRawOperationBytes
       completedChunks.addAndGet((bytes.toLong + rawOperationBytes - 1L) / rawOperationBytes)
     } catch {
+      case e: UrmaDmaUnresolvedException =>
+        quarantineUnresolvedDma()
+        failedChunks.incrementAndGet()
+        throw e
       case NonFatal(e) => failedChunks.incrementAndGet(); throw e
     }
+  }
+
+  private def quarantineUnresolvedDma(): Unit = {
+    dmaUnresolved = true
+    UBBlockTransferService.quarantinedServices.add(this)
+    // A failed accounting step after native submission has the same memory
+    // ownership ambiguity as a CQ timeout. Keep the local slice and peer lease.
+    if (arena != null) arena.releaseOwner("remote-fetch")
   }
 
   private def validateDescriptor(descriptor: Descriptor, peer: PeerIdentity, blockId: String): Unit = {
@@ -727,7 +881,14 @@ private[scache] class UBBlockTransferService(
   private def acceptLoop(): Unit = while (!closed) {
     try {
       val socket = server.accept()
-      workers.execute(() => serve(socket))
+      try workers.execute(() => serve(socket))
+      catch {
+        case NonFatal(e) =>
+          // close() may shut down the executor after accept() returned a socket.
+          // A rejected handoff must not leave that control connection open.
+          try socket.close() catch { case NonFatal(_) => () }
+          throw e
+      }
     } catch {
       case _: java.net.SocketException if closed =>
       case NonFatal(e) => if (!closed) logWarning("UB control accept failed", e)
@@ -798,9 +959,10 @@ private[scache] class UBBlockTransferService(
   }
 
   private def withControl[T](host: String, remotePort: Int)(body: (ControlChannel, PeerIdentity) => T): T = {
-    val socket = new Socket(host, remotePort)
-    socket.setSoTimeout(timeoutMs)
+    val socket = new Socket()
     try {
+      socket.connect(new InetSocketAddress(host, remotePort), timeoutMs)
+      socket.setSoTimeout(timeoutMs)
       val channel = new ControlChannel(socket)
       channel.exchange(Hello(nodeId, epoch, endpoint.clone())) match {
         case Hello(remoteNode, remoteEpoch, remoteEndpoint) =>
@@ -828,6 +990,7 @@ private[scache] class UBBlockTransferService(
   }
 
   private def requireReady(): Unit = {
+    if (dmaUnresolved) throw new UrmaDmaUnresolvedException("UB transport quarantined after unresolved DMA")
     if (closed || transport == null || arena == null) throw new IllegalStateException("UB transport is not ready")
   }
 
@@ -846,8 +1009,8 @@ private[scache] class UBBlockTransferService(
     }
   }
 
-  override def close(): Unit = {
-    if (closed) return
+  override def close(): Unit = synchronized {
+    if (closeCompleted) return
     summary(s"UB BlockTransferService closing node=$nodeId reads=${readRequests.get()} " +
       s"writes=${writeRequests.get()} completedChunks=${completedChunks.get()} " +
       s"failedChunks=${failedChunks.get()} checksumErrors=${checksumErrors.get()} " +
@@ -855,9 +1018,26 @@ private[scache] class UBBlockTransferService(
     closed = true
     if (server != null) try server.close() catch { case NonFatal(_) => }
     if (acceptThread != null) try acceptThread.join(1000L) catch { case _: InterruptedException => Thread.currentThread.interrupt() }
-    if (arena != null) try arena.close(unpublishTimeoutMs) catch { case NonFatal(e) => logWarning("UB arena close failed", e) }
-    workers.shutdownNow()
-    if (transport != null) try transport.close() catch { case NonFatal(e) => logWarning("UB transport close failed", e) }
+    try {
+      val activeConsumers = importedSharedBlocks.synchronized {
+        sharedPoolConsumerRefs.valuesIterator.map(_.toLong).sum
+      }
+      if (activeConsumers != 0L) {
+        throw new IllegalStateException(
+          s"cannot close UB pool while $activeConsumers local consumers still own slices")
+      }
+      if (arena != null) arena.close(unpublishTimeoutMs)
+      if (transport != null) transport.close()
+      closeCompleted = true
+      UBBlockTransferService.quarantinedServices.remove(this)
+    } catch {
+      case NonFatal(e) =>
+        // Keep the arena's backing DirectByteBuffer reachable, and do not
+        // unregister its MR by continuing into transport.close after failure.
+        UBBlockTransferService.quarantinedServices.add(this)
+        logError("UB close incomplete: memory retained until DMA ownership is resolved", e)
+        throw new IllegalStateException("UB_CLOSE_QUARANTINED: resources were not reclaimed", e)
+    } finally workers.shutdownNow()
   }
 
   private[scache] def urmaMetrics: Map[String, Long] = {
@@ -901,6 +1081,9 @@ private[scache] class UBBlockTransferService(
       "urma.transportFailedOperations" -> native.map(_.failedOperations).getOrElse(0L),
       "urma.transportTimedOutOperations" -> native.map(_.timedOutOperations).getOrElse(0L),
       "urma.transportInflightOperations" -> native.map(_.inflightOperations).getOrElse(0L),
+      "urma.carrierBytes" -> native.map(backend(_, "carrierBytes")).getOrElse(0L),
+      "urma.carrierLateOperations" -> native.map(_.carrierLateOperations).getOrElse(0L),
+      "urma.controlPayloadBytes" -> native.map(backend(_, "controlPayloadBytes")).getOrElse(0L),
       "urma.activeMappings" -> native.map(backend(_, "activeMappings")).getOrElse(0L),
       "urma.activeTokens" -> native.map(backend(_, "registeredTokens")).getOrElse(0L),
       "urma.activeSlots" -> native.map(backend(_, "activeSlots")).getOrElse(0L),
@@ -952,7 +1135,11 @@ private[scache] class UBBlockTransferService(
 }
 
 private[ub] object UBBlockTransferService {
-  private val ControlProtocolVersion = 1
+  // Strong references are intentional: a failed close is not permission for
+  // GC to reclaim memory still exposed to a peer. No timer discards this set.
+  private val quarantinedServices = java.util.concurrent.ConcurrentHashMap
+    .newKeySet[UBBlockTransferService]()
+  private val ControlProtocolVersion = 2
   private val ControlHeaderBytes = 17L // opcode + protocol version + request/correlation id + length
   private val MaxControlFrame = 64 * 1024
   private[ub] def validateControlHeader(
@@ -971,10 +1158,14 @@ private[ub] object UBBlockTransferService {
         s"stale or mismatched UB descriptor block=${descriptor.blockId} producer=${descriptor.nodeId}/${descriptor.epoch} " +
           s"expected=$blockId/${peer.nodeId}/${peer.epoch}")
     }
-    if (descriptor.offset < 0 || descriptor.length < 0 || descriptor.baseAddress <= 0 ||
+    if (descriptor.offset < 0 || descriptor.length < 0 || descriptor.baseAddress == 0 ||
+        java.lang.Long.compareUnsigned(descriptor.baseAddress,
+          -1L - descriptor.offset.toLong) > 0 ||
         descriptor.remoteAddress != descriptor.baseAddress + descriptor.offset) {
       throw new IllegalStateException(s"invalid UB descriptor bounds for $blockId")
     }
+    if (descriptor.segment == null) throw new IllegalStateException("missing remote MR identity")
+    descriptor.remote // validates token, generation and the granted block window
   }
   private sealed trait Message { def kind: Int }
   private final case class PeerIdentity(nodeId: String, epoch: Long) {
@@ -996,10 +1187,11 @@ private[ub] object UBBlockTransferService {
 
   private[ub] final case class Descriptor(protocolVersion: Int, nodeId: String, epoch: Long, arenaId: String,
       baseAddress: Long, offset: Int, remoteAddress: Long, length: Int, token: Int,
-      segmentGeneration: Long, generation: Long, crc: Long, leaseId: String, blockId: String) {
-    // generation is the lease/block generation. segmentGeneration is retained
-    // for descriptor compatibility and is zero with generic public UMDK providers.
-    def remote: RemoteBuffer = new RemoteBuffer(remoteAddress, length.toLong, token, segmentGeneration)
+      segmentGeneration: Long, generation: Long, crc: Long, leaseId: String, blockId: String,
+      segment: SegmentDescriptor = null) {
+    // generation identifies the lease/block; segmentGeneration identifies the
+    // registration for cache reuse, not a provider-specific import parameter.
+    def remote: RemoteBuffer = new RemoteBuffer(remoteAddress, length.toLong, token, segmentGeneration, segment)
   }
   /** Local shared-memory bridge descriptor; remote peers never consume its path. */
   private[scache] final case class PoolSlice(path: String, offset: Long, length: Int, generation: Long)
@@ -1019,15 +1211,20 @@ private[ub] object UBBlockTransferService {
     val raw = new Array[Byte](length); in.readFully(raw); new String(raw, StandardCharsets.UTF_8)
   }
   private def putDescriptor(out: DataOutputStream, d: Descriptor): Unit = {
+    require(d.segment != null, "missing remote MR identity")
     out.writeInt(d.protocolVersion); putString(out, d.nodeId); out.writeLong(d.epoch); putString(out, d.arenaId)
     out.writeLong(d.baseAddress); out.writeInt(d.offset); out.writeLong(d.remoteAddress); out.writeInt(d.length)
     out.writeInt(d.token); out.writeLong(d.segmentGeneration); out.writeLong(d.generation); out.writeLong(d.crc)
     putString(out, d.leaseId); putString(out, d.blockId)
+    out.write(d.segment.toBytes())
   }
   private def getDescriptor(in: DataInputStream): Descriptor = {
-    val version = in.readInt(); if (version != 1) throw new IllegalArgumentException(s"unsupported descriptor protocol $version")
-    Descriptor(version, getString(in), in.readLong(), getString(in), in.readLong(), in.readInt(), in.readLong(),
+    val version = in.readInt(); if (version != ControlProtocolVersion) throw new IllegalArgumentException(s"unsupported descriptor protocol $version")
+    val d = Descriptor(version, getString(in), in.readLong(), getString(in), in.readLong(), in.readInt(), in.readLong(),
       in.readInt(), in.readInt(), in.readLong(), in.readLong(), in.readLong(), getString(in), getString(in))
+    val bytes = new Array[Byte](SegmentDescriptor.WIRE_BYTES)
+    in.readFully(bytes)
+    d.copy(segment = SegmentDescriptor.fromBytes(bytes))
   }
   private def encode(message: Message): Array[Byte] = {
     val raw = new java.io.ByteArrayOutputStream(); val out = new DataOutputStream(raw)
@@ -1066,8 +1263,9 @@ private[ub] object UBBlockTransferService {
   }
 
   private[ub] def runProtocolContracts(): Seq[(String, Boolean)] = {
-    val d = Descriptor(1, "node", 7L, "arena", 0x1000L, 16, 0x1010L, 64, 3, 42L, 9L, 123L,
-      "lease", "scache_contract_1_1_0_0")
+    val d = Descriptor(ControlProtocolVersion, "node", 7L, "arena", 0x1000L, 16, 0x1010L, 64, 3, 42L, 9L, 123L,
+      "lease", "scache_contract_1_1_0_0",
+      new SegmentDescriptor(new Array[Byte](16), 17, 0, 0x1000L, 4096L, 3, 42L))
     val messages: Seq[(String, Message)] = Seq(
       "hello" -> Hello("node", 7L, new Array[Byte](64)), "capabilities" -> Capabilities,
       "acquire" -> Acquire(d.blockId), "acquired" -> Grant(d), "not_found" -> NotFound,
@@ -1087,11 +1285,11 @@ private[ub] object UBBlockTransferService {
     }
     rejected("unknown_opcode") { decode(255, Array.emptyByteArray) }
     rejected("trailing_bytes") { decode(Ack.kind, Array[Byte](1)) }
-    rejected("protocol_version") { validateControlHeader(2, 1L, 0, Set.empty) }
-    rejected("zero_request_id") { validateControlHeader(1, 0L, 0, Set.empty) }
-    rejected("duplicate_request_id") { validateControlHeader(1, 3L, 0, Set(3L)) }
-    rejected("negative_frame") { validateControlHeader(1, 4L, -1, Set.empty) }
-    rejected("oversize_frame") { validateControlHeader(1, 5L, MaxControlFrame + 1, Set.empty) }
+    rejected("protocol_version") { validateControlHeader(1, 1L, 0, Set.empty) }
+    rejected("zero_request_id") { validateControlHeader(ControlProtocolVersion, 0L, 0, Set.empty) }
+    rejected("duplicate_request_id") { validateControlHeader(ControlProtocolVersion, 3L, 0, Set(3L)) }
+    rejected("negative_frame") { validateControlHeader(ControlProtocolVersion, 4L, -1, Set.empty) }
+    rejected("oversize_frame") { validateControlHeader(ControlProtocolVersion, 5L, MaxControlFrame + 1, Set.empty) }
     results += "descriptor_epoch_match" -> {
       validateDescriptorIdentity(d, PeerIdentity("node", 7L), d.blockId); true
     }
@@ -1206,7 +1404,7 @@ private[ub] object UBBlockTransferService {
     private val arenas: Vector[RegisteredArena] = Vector.tabulate[RegisteredArena](arenaCount) { index =>
       new RegisteredArena(
         transport, bytesPerArena, nodeId, epoch, leaseTimeoutMs,
-        sharedDirectory.map(dir => sharedArenaFile(dir, nodeId, index)),
+        sharedDirectory.map(dir => sharedArenaFile(dir, nodeId, epoch, index)),
         forceSharedCommit, checksumEnabled)
     }
     val capacity: Int = bytesPerArena
@@ -1291,9 +1489,15 @@ private[ub] object UBBlockTransferService {
     }
   }
 
-  private def sharedArenaFile(directory: String, nodeId: String, index: Int): String = {
+  private def sharedArenaFile(directory: String, nodeId: String, epoch: Long, index: Int): String = {
     val safeNode = nodeId.replaceAll("[^A-Za-z0-9_.-]", "_")
-    Paths.get(directory, s"$safeNode-arena-$index.pool").toString
+    val parent = Paths.get(directory)
+    Files.createDirectories(parent)
+    // A restarted/replacement instance must not map the previous instance's
+    // backing file while old Spark consumers or quarantined MRs may still
+    // reference it. Atomic unique creation also separates equal supplied epochs.
+    Files.createTempFile(parent,
+      s"$safeNode-epoch-${java.lang.Long.toUnsignedString(epoch)}-arena-$index-", ".pool").toString
   }
 
   /** One stable registration; individual descriptors are offset windows in it. */
@@ -1371,6 +1575,8 @@ private[ub] object UBBlockTransferService {
     }
     def releaseDetailed(leaseId: String, generation: Long, ownerPeer: String): ReleaseResult = synchronized {
       leases.get(leaseId) match {
+        case Some(lease) if lease.state == "OWNER_DISCONNECTED" =>
+          LeaseRejected("disconnected owner: remote DMA drain has not been established")
         case Some(lease) if lease.entry.generation != generation => LeaseRejected("stale lease generation")
         case Some(lease) if lease.ownerPeer != ownerPeer => LeaseRejected("lease owner mismatch")
         case Some(lease) if System.nanoTime() > lease.deadline =>
@@ -1436,7 +1642,8 @@ private[ub] object UBBlockTransferService {
       }
       val lease = leases.getOrElse(entryLease(entry, ownerPeer),
         throw new IllegalStateException(s"unknown UB shared writer lease block=$blockId"))
-      if (lease.ownerPeer != ownerPeer || lease.entry.generation != entry.generation ||
+      if (lease.state == "OWNER_DISCONNECTED" ||
+          lease.ownerPeer != ownerPeer || lease.entry.generation != entry.generation ||
           System.nanoTime() > lease.deadline) {
         throw new IllegalStateException(s"UB shared writer lease is stale block=$blockId")
       }
@@ -1487,12 +1694,23 @@ private[ub] object UBBlockTransferService {
         blockId: String, ownerPeer: String, timeoutMs: Int): Unit = synchronized {
       entries.get(blockId).foreach { entry =>
         entry.state match {
-          case Published | Unpublishing =>
+          case Unpublishing =>
+            // Another retirement owns this entry while Object.wait releases
+            // the monitor. Do not become a second waiter or reset its state.
+            throw new IllegalStateException(s"UB shared block $blockId is already being unpublished")
+          case Published =>
             entry.state = Unpublishing
             val until = if (timeoutMs <= 0) 0L
             else System.nanoTime() + timeoutMs.toLong * 1000000L
-            while (entry.leases > 0 && timeoutMs > 0 && System.nanoTime() < until) {
-              wait(math.max(1L, (until - System.nanoTime()) / 1000000L))
+            try {
+              while (entry.leases > 0 && timeoutMs > 0 && System.nanoTime() < until) {
+                wait(math.max(1L, (until - System.nanoTime()) / 1000000L))
+              }
+            } catch {
+              case e: InterruptedException =>
+                entry.state = Published
+                Thread.currentThread().interrupt()
+                throw e
             }
             if (entry.leases > 0) {
               entry.state = Published
@@ -1501,6 +1719,9 @@ private[ub] object UBBlockTransferService {
             }
             freeEntry(entry)
           case Writing =>
+            if (leases.values.exists(lease => (lease.entry eq entry) && lease.state == "OWNER_DISCONNECTED")) {
+              throw new IllegalStateException(s"cannot replace quarantined UB block $blockId")
+            }
             val owned = leases.values.filter(lease =>
               (lease.entry eq entry) && lease.ownerPeer == ownerPeer).toVector
             owned.foreach { lease =>
@@ -1525,6 +1746,8 @@ private[ub] object UBBlockTransferService {
 
     def commit(leaseId: String, generation: Long, ownerPeer: String = "local-contract"): Committed = synchronized {
       val lease = leases.getOrElse(leaseId, throw new IllegalStateException("unknown prepared lease"))
+      if (lease.state == "OWNER_DISCONNECTED")
+        throw new IllegalStateException("cannot commit a disconnected owner's quarantined lease")
       val entry = lease.entry
       if (entry.generation != generation || entry.state != Writing) throw new IllegalStateException("stale prepared lease")
       if (lease.ownerPeer != ownerPeer) throw new IllegalStateException("prepared lease owner mismatch")
@@ -1539,6 +1762,8 @@ private[ub] object UBBlockTransferService {
     }
     def abort(leaseId: String, generation: Long, ownerPeer: String = "local-contract"): Unit = synchronized {
       leases.get(leaseId).foreach { lease =>
+        if (lease.state == "OWNER_DISCONNECTED")
+          throw new IllegalStateException("cannot abort a disconnected owner's quarantined lease")
         val entry = lease.entry
         if (entry.generation == generation && entry.state == Writing && lease.ownerPeer == ownerPeer) {
           leases.remove(leaseId); lease.state = "ABORTED"; rememberReleased(lease); entry.state = Failed; freeEntry(entry)
@@ -1547,11 +1772,10 @@ private[ub] object UBBlockTransferService {
     }
     def releaseOwner(ownerPeer: String): Unit = synchronized {
       leases.values.filter(_.ownerPeer == ownerPeer).toVector.foreach { lease =>
-        leases.remove(lease.leaseId)
-        lease.state = "OWNER_CLOSED"
-        rememberReleased(lease)
-        lease.entry.leases -= 1
-        if (lease.entry.state == Writing) { lease.entry.state = Failed; freeEntry(lease.entry) }
+        // TCP loss is not a DMA fence. Keep both the lease and its slice pinned;
+        // even a remote WRITE may still be owned by the peer provider. Explicit
+        // successful RELEASE/COMMIT before disconnect leaves no lease here.
+        lease.state = "OWNER_DISCONNECTED"
       }
       notifyAll()
     }
@@ -1560,7 +1784,15 @@ private[ub] object UBBlockTransferService {
         if (entry.state != Published) throw new IllegalStateException(s"block $blockId is not published")
         entry.state = Unpublishing
         val until = if (timeoutMs <= 0) 0L else System.nanoTime() + timeoutMs.toLong * 1000000L
-        while (entry.leases > 0 && timeoutMs > 0 && System.nanoTime() < until) wait(math.max(1L, (until - System.nanoTime()) / 1000000L))
+        try {
+          while (entry.leases > 0 && timeoutMs > 0 && System.nanoTime() < until)
+            wait(math.max(1L, (until - System.nanoTime()) / 1000000L))
+        } catch {
+          case e: InterruptedException =>
+            entry.state = Published
+            Thread.currentThread().interrupt()
+            throw e
+        }
         if (entry.leases > 0) { entry.state = Published; throw new IllegalStateException(s"timed out waiting for UB leases of $blockId") }
         freeEntry(entry)
       }
@@ -1612,11 +1844,11 @@ private[ub] object UBBlockTransferService {
       registrationClosed = true
     }
 
-    private def descriptor(entry: Entry, lease: String) = Descriptor(1, nodeId, epoch, arenaId,
+    private def descriptor(entry: Entry, lease: String) = Descriptor(ControlProtocolVersion, nodeId, epoch, arenaId,
       registration.remoteAddress, entry.slice.offset, registration.remoteAddress + entry.slice.offset,
       if (entry.state == Published) entry.committedLength else entry.slice.length,
       registration.token.toInt, registration.generation, entry.generation,
-      entry.expectedCrc, lease, entry.blockId)
+      entry.expectedCrc, lease, entry.blockId, registration.segment)
     private def generation(): Long = { val value = nextGeneration; nextGeneration += 1; value }
     private def entryLease(entry: Entry, ownerPeer: String): String = {
       leases.values.find(lease => (lease.entry eq entry) && lease.ownerPeer == ownerPeer)
@@ -1646,6 +1878,10 @@ private[ub] object UBBlockTransferService {
       while (releasedLeases.size > 4096) releasedLeases.remove(releasedLeases.head._1)
     }
     private def freeEntry(entry: Entry): Unit = {
+      // wait() releases the arena monitor: close may already have removed this
+      // exact entry before a retirement resumes. Never free a stale generation
+      // or remove a newer entry that happens to have the same logical block ID.
+      if (!entries.get(entry.blockId).exists(_ eq entry)) return
       entries.remove(entry.blockId)
       leases.retain { case (_, lease) => lease.entry ne entry }
       releaseSlice(entry.slice); notifyAll()

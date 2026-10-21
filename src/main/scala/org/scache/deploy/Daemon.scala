@@ -126,9 +126,21 @@ class Daemon(
 
   private def askClient[T: ClassTag](operation: String, message: Any): T = {
     val correlationId = s"${endpointConfig.correlationPrefix}-$operation-${requestSequence.incrementAndGet()}"
-    val totalAttempts = conf.getInt("scache.rpc.numRetries", 3) + 1
+    // A pool fetch reserves a consumer and a release decrements its reference count.
+    // Neither operation is idempotent when the reply is lost: askWithRetry can execute
+    // the same message twice, leaking a reservation or freeing another reader's slice.
+    // Until the IPC protocol carries a per-consumer idempotency token, fail the
+    // affected UB call on an ambiguous timeout instead of replaying it.
+    val oneShotUbPoolOperation = clientIdentity.backend.equalsIgnoreCase("ub") &&
+      Set("get-ipc", "get-ipc-batch", "release-imported-block").contains(operation)
+    val totalAttempts = if (oneShotUbPoolOperation) 1 else RpcUtils.numRetries(conf)
     try {
-      val result = clientRef.askWithRetry[T](message)
+      val result = if (oneShotUbPoolOperation) {
+        val timeout = RpcUtils.askRpcTimeout(conf)
+        timeout.awaitResult(clientRef.ask[T](message, timeout))
+      } else {
+        clientRef.askWithRetry[T](message)
+      }
       logDebug(s"SCACHE_DAEMON_RPC_COMPLETED correlationId=$correlationId operation=$operation " +
         s"target=$clientHost:$clientPort attempt=1/$totalAttempts")
       result

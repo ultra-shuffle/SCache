@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Java/JNI URMA test matrix — runs all mandatory operation/size combinations.
+# Historical Tier-S simulation matrix, not the current hardware test entry.
 set -euo pipefail
+
+echo 'LEGACY_TIER_S_SIMULATION_ONLY: this matrix injects openurma_shim/FAKE_ROOT and legacy RC diagnostics; it does not validate real UB hardware.' >&2
+if [[ ${SCACHE_ALLOW_LEGACY_TIER_S:-0} != 1 ]]; then
+    echo 'Disabled by default. Use delivery tools/ub-two-node-rm-ctp/30-native-cross-node.sh and 40-scache-transfer.sh for hardware tests, or native CTest offline contracts without hardware.' >&2
+    echo 'Only historical simulation reproduction may explicitly set SCACHE_ALLOW_LEGACY_TIER_S=1; it is not a supported current RM/CTP test.' >&2
+    exit 2
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HERE/../build"

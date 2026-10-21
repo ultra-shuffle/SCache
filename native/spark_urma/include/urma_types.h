@@ -14,7 +14,13 @@ namespace spark_urma {
 
 // ---- Transport configuration ----
 struct TransportOptions {
-    std::string device_name;
+    std::string device_name; // explicit hardware device selection is required
+    std::string wire_role;   // legacy caller field; ignored by hardware transport
+    uint32_t transport_mode = 2; // public UMDK URMA_TM_RC; RM is 1, not CLI -p 0
+    uint32_t tp_type = 0;        // public UMDK URMA_RTP; CTP is 1
+    uint32_t eid_index = 0;
+    uint32_t priority = 0;
+    uint32_t drain_timeout_ms = 5000;
     uint32_t queue_depth = 128;
     uint32_t poll_batch = 32;
     uint32_t request_timeout_ms = 30000;
@@ -29,10 +35,14 @@ struct RegisteredRegion {
     size_t length = 0;
     uint64_t remote_address = 0;
     uint64_t token = 0;
-    // Optional provider generation. Official UMDK providers may leave it zero;
-    // logical block generation is enforced independently by SCache.
+    // Software registration generation; used for peer cache identity only.
+    // Never passed as the public NOMAP import's mapping address.
     uint64_t generation = 0;
     uint64_t owner_epoch = 0;
+    uint8_t segment_eid[16] = {};
+    uint32_t segment_uasid = 0;
+    uint32_t segment_attributes = 0;
+    uint64_t segment_length = 0;
 };
 
 // ---- Remote memory region descriptor ----
@@ -41,6 +51,12 @@ struct RemoteRegion {
     uint64_t length = 0;
     uint64_t token = 0;
     uint64_t generation = 0;
+    uint8_t segment_eid[16] = {};
+    uint32_t segment_uasid = 0;
+    uint32_t segment_attributes = 0;
+    uint64_t segment_address = 0;
+    uint64_t segment_length = 0;
+    bool has_segment = false;
 };
 
 // ---- Completion result ----
@@ -72,22 +88,23 @@ struct ProcessRuntimeMetrics {
 
 // ---- Endpoint descriptor exchanged via control channel ----
 struct EndpointDescriptor {
-    uint32_t protocol_version = 1;
+    uint32_t protocol_version = 2;
     uint32_t uasid = 0;
     uint32_t jetty_id = 0;
-    uint32_t reserved0 = 0;  // binary-layout padding before the 16-byte EID
+    uint32_t tp_type = 0;   // former padding, explicitly negotiated in protocol 2
     uint8_t eid[16] = {};
     uint64_t segment_address = 0;
     uint64_t segment_length = 0;
     uint32_t segment_token = 0;
     uint32_t max_chunk_bytes = 10U * 1024U * 1024U;
-    uint32_t transport_mode = 0;    // URMA_TM_RC
-    // Provider segment EID index; the jetty uasid above remains the value
-    // required for urma_import_jetty. Serialized in the former final pad.
+    uint32_t transport_mode = 0;    // Filled by init: public API RM=1, RC=2.
+    // MR UBVA UASID, not the device's configured EID index. The jetty uasid
+    // above identifies the remote Jetty. Serialized in the former final pad.
     uint32_t segment_uasid = 0;
-    // Optional provider MR generation, appended after the original 64-byte
-    // descriptor for protocol-compatible extension.
+    // Project registration generation, not a public NOMAP mapping address.
+    // Appended after the original 64-byte descriptor for the wire extension.
     uint64_t segment_generation = 0;
+    uint8_t segment_eid[16] = {}; // provider MR identity, distinct from Jetty EID
 
     // Serialize to/from network byte order
     void to_network();
@@ -95,7 +112,8 @@ struct EndpointDescriptor {
 };
 
 // ---- Protocol versions ----
-static constexpr uint32_t PROTOCOL_VERSION = 1;
+static constexpr uint32_t PROTOCOL_VERSION = 2;
+static_assert(sizeof(EndpointDescriptor) == 88, "endpoint protocol 2 layout must be 88 bytes");
 
 // ---- Error codes ----
 enum class ErrorCode : int32_t {

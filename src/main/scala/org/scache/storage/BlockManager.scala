@@ -1674,6 +1674,11 @@ private[scache] class BlockManager(
 
   /** Remove SCache shuffle blocks for one application job/shuffle namespace. */
   def removeShuffle(appName: String, shuffleId: Int, jobId: Int = -1): Int = {
+    blockTransferService match {
+      case ub: org.scache.network.ub.UBBlockTransferService =>
+        ub.retireShuffleNamespace(appName, shuffleId, jobId)
+      case _ =>
+    }
     val blocksToRemove = (blockInfoManager.entries.map(_._1) ++ diskBlockManager.getAllBlocks())
       .collect {
         case blockId: ScacheBlockId
@@ -1697,6 +1702,11 @@ private[scache] class BlockManager(
 
   /** Remove all SCache blocks belonging to an application namespace. */
   def removeApplication(appName: String): Int = {
+    blockTransferService match {
+      case ub: org.scache.network.ub.UBBlockTransferService =>
+        ub.retireApplicationNamespace(appName)
+      case _ =>
+    }
     val blocksToRemove = (blockInfoManager.entries.map(_._1) ++ diskBlockManager.getAllBlocks())
       .collect {
         case blockId: ScacheBlockId
@@ -1706,7 +1716,7 @@ private[scache] class BlockManager(
     blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster = false) }
     blockTransferService match {
       case ub: org.scache.network.ub.UBBlockTransferService =>
-        ub.releaseCachedRemoteImports()
+        ub.releaseCachedRemoteImportsForApplication(appName)
       case _ =>
     }
     if (blocksToRemove.nonEmpty) {
@@ -1734,6 +1744,12 @@ private[scache] class BlockManager(
     logDebug(s"Removing block $blockId")
     blockInfoManager.lockForWriting(blockId) match {
       case None =>
+        // lockForWriting also returns None when an interrupted waiter could not
+        // acquire the lock. Never treat that case as a missing block and delete
+        // its disk bytes or UB descriptor without exclusive ownership.
+        if (Thread.currentThread().isInterrupted) {
+          throw new IllegalStateException(s"Interrupted before locking block $blockId for removal")
+        }
         // The block has already been removed; do nothing.
         // A disk-only block can survive without a BlockInfo entry after a failed
         // registration. Still withdraw its UB descriptor and delete the file.
@@ -1746,25 +1762,32 @@ private[scache] class BlockManager(
           logDebug(s"Asked to remove block $blockId, which does not exist")
         }
       case Some(info) =>
-        // Withdraw the remote descriptor before the underlying SCache bytes can disappear.
-        // This waits for active URMA leases (bounded by the UB configuration) and preserves
-        // the old block when a safe withdrawal cannot be established.
-        blockTransferService match {
-          case ub: org.scache.network.ub.UBBlockTransferService => ub.unpublishBlock(blockId)
-          case _ =>
-        }
-        // Removals are idempotent in disk store and memory store. At worst, we get a warning.
-        val removedFromMemory = memoryStore.remove(blockId)
-        val removedFromDisk = diskStore.remove(blockId)
-        if (!removedFromMemory && !removedFromDisk) {
-          logWarning(s"Block $blockId could not be removed as it was not found in either " +
-            "the disk, memory, or external block store")
-        }
-        blockInfoManager.removeBlock(blockId)
-        removeExternalBlockSize(blockId)
-        val removeBlockStatus = getCurrentBlockStatus(blockId, info)
-        if (tellMaster && info.tellMaster) {
-          reportBlockStatus(blockId, info, removeBlockStatus)
+        var removedFromLockTable = false
+        try {
+          // A failed UB withdrawal must leave both the bytes and the write lock retryable.
+          // removeBlock releases the lock only on its successful path.
+          blockTransferService match {
+            case ub: org.scache.network.ub.UBBlockTransferService => ub.unpublishBlock(blockId)
+            case _ =>
+          }
+          // Removals are idempotent in disk store and memory store. At worst, we get a warning.
+          val removedFromMemory = memoryStore.remove(blockId)
+          val removedFromDisk = diskStore.remove(blockId)
+          if (!removedFromMemory && !removedFromDisk) {
+            logWarning(s"Block $blockId could not be removed as it was not found in either " +
+              "the disk, memory, or external block store")
+          }
+          blockInfoManager.removeBlock(blockId)
+          removedFromLockTable = true
+          removeExternalBlockSize(blockId)
+          val removeBlockStatus = getCurrentBlockStatus(blockId, info)
+          if (tellMaster && info.tellMaster) {
+            reportBlockStatus(blockId, info, removeBlockStatus)
+          }
+        } finally {
+          if (!removedFromLockTable && blockInfoManager.get(blockId).nonEmpty) {
+            blockInfoManager.unlockWrite(blockId)
+          }
         }
 
     }

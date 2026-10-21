@@ -2,6 +2,7 @@ package org.scache.deploy
 
 import java.io.File
 import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicReference
 
 import org.scache.rpc.RpcEnv
 import org.scache.storage.{ScacheBlockId, StorageLevel}
@@ -164,6 +165,9 @@ import scala.util.Random
 	    conf.set("scache.daemon.port", daemonPort.toString, slient = true)
 	    conf.set("scache.driver.host", opts.host, slient = true)
 	    conf.set("scache.driver.port", masterPort.toString, slient = true)
+	    // This test asserts local BlockManager ownership. Do not inherit a developer's
+	    // shared-CXL config, which registers only a global pool location instead.
+	    conf.set("scache.storage.cxl.shared.enabled", "false", slient = true)
 
     // Keep the daemon->client ingestion in memory for easy verification.
     conf.set("scache.daemon.putBlock.storageLevel.local", "MEMORY_ONLY", slient = true)
@@ -206,7 +210,14 @@ import scala.util.Random
 	      clientEndpoint.blockManager != null && clientEndpoint.clientId >= 0
 	    }
 
-	    val daemon = new Daemon(opts.scacheHome, "itest")
+	    // The Daemon creates its own ScacheConf from scacheHome; settings made only on the
+	    // in-process test conf are not visible there. Bind it to this test's actual client ports.
+	    val daemon = new Daemon(opts.scacheHome, "itest", DaemonEndpointConfig(
+	      bindHost = Some(opts.host),
+	      bindPort = Some(daemonPort),
+	      clientHost = Some(opts.host),
+	      clientPort = Some(clientPort),
+	      correlationPrefix = "ipc-integration"))
 
 	    // Push blocks via the real daemon->client IPC path.
 	    val appName = "itest"
@@ -237,11 +248,46 @@ import scala.util.Random
     blocks.foreach { case (blockId, expected) =>
       awaitCondition(s"block $blockId present", opts.timeoutMs) {
         clientEndpoint.blockManager.getLocalBytes(blockId).exists { buf =>
-          val got = buf.toArray
-          java.util.Arrays.equals(got, expected)
+          try java.util.Arrays.equals(buf.toArray, expected)
+          finally clientEndpoint.blockManager.releaseLock(blockId)
         }
       }
     }
+
+    // An interrupted writer must not turn lockForWriting(None) into an unlocked deletion.
+    // Keep a reader active, interrupt the removal waiter, then retry after releasing the reader.
+    val interruptedBlock = blocks.head._1
+    val heldRead = clientEndpoint.blockManager.getLocalBytes(interruptedBlock)
+      .getOrElse(throw new IllegalStateException(s"missing test block $interruptedBlock"))
+    val removalError = new AtomicReference[Throwable]()
+    val remover = new Thread(() => {
+      try clientEndpoint.blockManager.removeBlock(interruptedBlock, tellMaster = false)
+      catch { case e: Throwable => removalError.set(e) }
+    }, "interrupted-block-remover")
+    try {
+      remover.start()
+      awaitCondition("remover waiting for read lock", opts.timeoutMs) {
+        remover.getState == Thread.State.WAITING
+      }
+      remover.interrupt()
+      remover.join(opts.timeoutMs)
+      if (remover.isAlive || !removalError.get().isInstanceOf[IllegalStateException]) {
+        throw new IllegalStateException("interrupted removal did not fail safely", removalError.get())
+      }
+      if (!java.util.Arrays.equals(heldRead.toArray, blocks.head._2)) {
+        throw new IllegalStateException("interrupted removal changed a read-locked block")
+      }
+    } finally {
+      clientEndpoint.blockManager.releaseLock(interruptedBlock)
+      if (remover.isAlive) remover.join(opts.timeoutMs)
+    }
+    clientEndpoint.blockManager.removeBlock(interruptedBlock, tellMaster = false)
+    if (clientEndpoint.blockManager.getLocalBytes(interruptedBlock).nonEmpty) {
+      throw new IllegalStateException("block remained after the safe removal retry")
+    }
+    // scalastyle:off println
+    println("PASS interrupted-removal-lock-and-retry")
+    // scalastyle:on println
 
     // scalastyle:off println
 	    println(

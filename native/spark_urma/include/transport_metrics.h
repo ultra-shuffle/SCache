@@ -52,6 +52,10 @@ struct TransportMetrics {
 
     // Errors
     std::atomic<uint64_t> checksum_errors{0};
+    std::atomic<uint64_t> tcp_fallbacks{0};
+
+    // Control channel
+    std::atomic<uint64_t> tcp_control_bytes{0};
     std::atomic<uint64_t> tcp_payload_bytes{0};
 
     void record_write(uint64_t request_id, size_t bytes);
