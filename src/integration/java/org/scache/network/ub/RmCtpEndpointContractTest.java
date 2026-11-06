@@ -31,7 +31,7 @@ public final class RmCtpEndpointContractTest {
         ep.segmentToken = 0xfedcba98;
         ep.segmentGeneration = 42;
         byte[] wire = ep.toBytes();
-        check(wire.length == 88, "wire size");
+        check(wire.length == 92, "wire size including context length");
         check(ByteBuffer.wrap(wire).getInt(12) == 1, "TP field offset/byte order");
         check(wire[72] == 22, "segment EID offset");
         EndpointDescriptor decoded = EndpointDescriptor.fromBytes(wire);

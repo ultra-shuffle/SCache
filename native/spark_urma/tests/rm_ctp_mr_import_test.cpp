@@ -81,7 +81,7 @@ int main() {
         rejects([&] { t.find_or_import_remote_locked(invalid); });
         check(imports == 3, "invalid MR reached provider");
         fail_import = true; ++r.generation;
-        t.options_.device_name = "bonding-diagnostic";
+        t.options_.device_name = "udma-diagnostic";
         t.options_.transport_mode = URMA_TM_RM;
         t.options_.tp_type = URMA_CTP;
         t.options_.eid_index = 3; t.options_.priority = 7;
@@ -89,7 +89,7 @@ int main() {
         try { t.find_or_import_remote_locked(r); }
         catch (const std::runtime_error& error) {
             const std::string message = error.what();
-            diagnostic = message.find("urma_import_seg failed device=bonding-diagnostic") != std::string::npos &&
+            diagnostic = message.find("urma_import_seg failed device=udma-diagnostic") != std::string::npos &&
                 message.find("mode=RM tp=CTP eid_index=3 priority=7") != std::string::npos &&
                 message.find("errno=" + std::to_string(EACCES)) != std::string::npos &&
                 message.find("segment_length=8192") != std::string::npos;

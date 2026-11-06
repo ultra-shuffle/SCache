@@ -23,7 +23,7 @@ public final class UrmaNative {
         if (loaded) return;
         try {
             System.loadLibrary("SparkUrma");
-            if (nativeApiVersion() != 3) throw new UnsatisfiedLinkError("SCache requires libSparkUrma JNI API 3");
+            if (nativeApiVersion() != 4) throw new UnsatisfiedLinkError("SCache requires libSparkUrma JNI API 4 (context exchange)");
             loaded = true;
         } catch (UnsatisfiedLinkError e) {
             loadError = e;
@@ -37,10 +37,11 @@ public final class UrmaNative {
     static native int nativeApiVersion();
     static native long nativeInitV2(String deviceName, int queueDepth, int maxChunkBytes, boolean strict,
                                    int mode, int tpType, int eidIndex, int priority, int requestTimeoutMs, int drainTimeoutMs);
-    static native void nativeConnectV2(long handle, byte[] eid, int uasid, int jettyId,
+    static native void nativeConnectV3(long handle, byte[] eid, int uasid, int jettyId,
                                      int remoteMaxChunkBytes, int segmentUasid,
                                      long segmentGeneration, long segAddr,
-                                     long segLen, int segToken, int version, int mode, int tpType, byte[] segmentEid);
+                                     long segLen, int segToken, int version, int mode, int tpType, byte[] segmentEid,
+                                     byte[] providerContext);
     static native byte[] nativeGetLocalEndpoint(long handle);
     static native long[] nativeClose(long handle);
     static native void nativeShutdownProcessRuntime();
@@ -48,6 +49,7 @@ public final class UrmaNative {
 
     // ---- Buffer management ----
     static native long[] nativeRegisterBuffer(long handle, ByteBuffer directBuffer);
+    static native byte[] nativeGetSegmentContext(long handle, long regionHandle);
     static native void nativeUnregisterBuffer(long handle, long regionHandle);
     static native void nativeReleaseCachedRemoteImports(long handle);
 

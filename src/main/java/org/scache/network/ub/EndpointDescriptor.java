@@ -6,10 +6,12 @@ import java.util.Arrays;
 
 /**
  * Endpoint descriptor exchanged via TCP control channel before URMA data transfer.
- * Protocol 2: packed network byte order, 88 bytes; incompatible with protocol 1.
+ * Protocol 3: 88-byte network-order identity, context length, opaque SDK context.
+ * Both peers must use protocol 3; older descriptors are rejected.
  */
 public class EndpointDescriptor {
-    public int protocolVersion = 2;
+    public int protocolVersion = 3;
+    public byte[] providerContext = new byte[0];
     public int uasid;
     public int jettyId;
     public int tpType;
@@ -27,7 +29,7 @@ public class EndpointDescriptor {
 
     public byte[] toBytes() {
         validate();
-        ByteBuffer bb = ByteBuffer.allocate(SIZE).order(ByteOrder.BIG_ENDIAN);
+        ByteBuffer bb = ByteBuffer.allocate(SIZE + 4 + providerContext.length).order(ByteOrder.BIG_ENDIAN);
         bb.putInt(protocolVersion);
         bb.putInt(uasid);
         bb.putInt(jettyId);
@@ -41,12 +43,13 @@ public class EndpointDescriptor {
         bb.putInt(segmentUasid); // provider segment UBVA UASID; not the local EID index
         bb.putLong(segmentGeneration);
         bb.put(segmentEid);
+        bb.putInt(providerContext.length).put(providerContext);
         return bb.array();
     }
 
     public static EndpointDescriptor fromBytes(byte[] raw) {
-        if (raw == null || raw.length != SIZE) {
-            throw new UrmaProtocolException("endpoint descriptor must be exactly " + SIZE + " bytes");
+        if (raw == null || raw.length < SIZE + 4 || raw.length > SIZE + 4 + SegmentDescriptor.MAX_PROVIDER_CONTEXT) {
+            throw new UrmaProtocolException("invalid endpoint descriptor length");
         }
         EndpointDescriptor ep = new EndpointDescriptor();
         ByteBuffer bb = ByteBuffer.wrap(raw).order(ByteOrder.BIG_ENDIAN);
@@ -63,12 +66,17 @@ public class EndpointDescriptor {
         ep.segmentUasid = bb.getInt();
         ep.segmentGeneration = bb.getLong();
         bb.get(ep.segmentEid);
+        int contextLength = bb.getInt();
+        if (contextLength < 0 || contextLength != bb.remaining()) throw new UrmaProtocolException("invalid Jetty context length");
+        ep.providerContext = new byte[contextLength]; bb.get(ep.providerContext);
         ep.validate();
         return ep;
     }
 
     public void validate() {
-        if (protocolVersion != 2) throw new UrmaProtocolException("unsupported endpoint protocol " + protocolVersion);
+        if (protocolVersion != 3) throw new UrmaProtocolException("unsupported endpoint protocol " + protocolVersion);
+        if (providerContext == null || providerContext.length > SegmentDescriptor.MAX_PROVIDER_CONTEXT)
+            throw new UrmaProtocolException("invalid Jetty context length");
         if (eid == null || eid.length != 16) throw new UrmaProtocolException("EID must be exactly 16 bytes");
         if (segmentEid == null || segmentEid.length != 16) throw new UrmaProtocolException("segment EID must be exactly 16 bytes");
         if (!((transportMode == 1 && tpType == 1) || (transportMode == 2 && tpType == 0)))

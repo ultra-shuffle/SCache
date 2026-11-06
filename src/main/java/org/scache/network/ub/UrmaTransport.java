@@ -92,12 +92,12 @@ public final class UrmaTransport implements AutoCloseable {
         checkNotClosed();
         if (remote == null) throw new UrmaConnectionException("remote endpoint must not be null");
         remote.validate();
-        UrmaNative.nativeConnectV2(nativeHandle, remote.eid, remote.uasid, remote.jettyId,
+        UrmaNative.nativeConnectV3(nativeHandle, remote.eid, remote.uasid, remote.jettyId,
                                   remote.maxChunkBytes, remote.segmentUasid,
                                   remote.segmentGeneration,
                                   remote.segmentAddress, remote.segmentLength, remote.segmentToken,
                                   remote.protocolVersion, remote.transportMode, remote.tpType,
-                                  remote.segmentEid);
+                                  remote.segmentEid, remote.providerContext);
         maxChunkBytes = negotiatedRawLimit(localMaxChunkBytes, remote.maxChunkBytes);
     }
 
@@ -130,7 +130,8 @@ public final class UrmaTransport implements AutoCloseable {
             }
             byte[] eid = ByteBuffer.allocate(16).putLong(descriptor[5]).putLong(descriptor[6]).array();
             SegmentDescriptor segment = new SegmentDescriptor(eid, (int) descriptor[7], (int) descriptor[8],
-                descriptor[1], descriptor[9], (int) descriptor[3], descriptor[4]);
+                descriptor[1], descriptor[9], (int) descriptor[3], descriptor[4],
+                UrmaNative.nativeGetSegmentContext(nativeHandle, descriptor[0]));
             return new RegisteredBuffer(this, descriptor[0], buffer,
                 descriptor[1], descriptor[2], descriptor[3], descriptor[4], segment);
         } catch (RuntimeException | Error failure) {

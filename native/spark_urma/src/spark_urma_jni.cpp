@@ -91,23 +91,27 @@ static void validate_direct_range(JNIEnv* env, jobject buffer, jint offset, jint
 }
 
 static void decode_segment(JNIEnv* env, jbyteArray blob, RemoteRegion& remote) {
-    if (blob == nullptr || env->GetArrayLength(blob) != 56)
-        throw std::runtime_error("ERR_INVALID_ARG: complete 56-byte MR identity is required");
-    uint8_t data[56];
-    env->GetByteArrayRegion(blob, 0, 56, reinterpret_cast<jbyte*>(data));
+    if (blob == nullptr || env->GetArrayLength(blob) < 60 || env->GetArrayLength(blob) > 60 + 32768)
+        throw std::runtime_error("ERR_INVALID_ARG: complete version-3 MR identity is required");
+    const auto size = env->GetArrayLength(blob);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    env->GetByteArrayRegion(blob, 0, size, reinterpret_cast<jbyte*>(data.data()));
     if (env->ExceptionCheck()) throw std::runtime_error("ERR_INVALID_ARG: MR identity array access failed");
     const auto number = [&data](size_t start, size_t bytes) {
         uint64_t value = 0;
         for (size_t i = 0; i < bytes; ++i) value = (value << 8) | data[start + i];
         return value;
     };
-    std::memcpy(remote.segment_eid, data, 16);
+    std::memcpy(remote.segment_eid, data.data(), 16);
     remote.segment_uasid = static_cast<uint32_t>(number(16, 4));
     remote.segment_attributes = static_cast<uint32_t>(number(20, 4));
     remote.segment_address = number(24, 8);
     remote.segment_length = number(32, 8);
     if (number(40, 4) != remote.token || number(44, 4) != 0 || number(48, 8) != remote.generation)
         throw std::runtime_error("ERR_INVALID_ARG: block/MR identity mismatch");
+    if (number(56, 4) != data.size() - 60)
+        throw std::runtime_error("ERR_INVALID_ARG: truncated provider segment context");
+    remote.provider_context.assign(data.begin()+60, data.end());
     remote.has_segment = true;
 }
 
@@ -140,7 +144,7 @@ static jlongArray metrics_array(JNIEnv* env, const TransportMetrics& m) {
 extern "C" {
 
 JNIEXPORT jint JNICALL
-Java_org_scache_network_ub_UrmaNative_nativeApiVersion(JNIEnv*, jclass) { return 3; }
+Java_org_scache_network_ub_UrmaNative_nativeApiVersion(JNIEnv*, jclass) { return 4; }
 
 // Versioned symbols prevent accidental calls into a library with the old JNI signature.
 JNIEXPORT jlong JNICALL
@@ -186,12 +190,12 @@ Java_org_scache_network_ub_UrmaNative_nativeInitV2(
 // UrmaNative.nativeConnect(long handle, byte[] eid, int uasid, int jettyId,
 //                           long segAddr, long segLen, int segToken)
 JNIEXPORT void JNICALL
-Java_org_scache_network_ub_UrmaNative_nativeConnectV2(
+Java_org_scache_network_ub_UrmaNative_nativeConnectV3(
     JNIEnv* env, jclass clazz, jlong handle,
     jbyteArray eid, jint uasid, jint jettyId, jint remoteMaxChunkBytes,
     jint segmentUasid, jlong segmentGeneration,
     jlong segAddr, jlong segLen, jint segToken,
-    jint version, jint mode, jint tpType, jbyteArray segmentEid)
+    jint version, jint mode, jint tpType, jbyteArray segmentEid, jbyteArray providerContext)
 {
     (void)clazz;
     try {
@@ -219,7 +223,13 @@ Java_org_scache_network_ub_UrmaNative_nativeConnectV2(
         env->GetByteArrayRegion(segmentEid, 0, 16, reinterpret_cast<jbyte*>(remote.segment_eid));
         if (env->ExceptionCheck()) return;
 
-        transport->connect(remote);
+        if (providerContext == nullptr || env->GetArrayLength(providerContext) > 32768)
+            throw std::runtime_error("ERR_PROTOCOL: invalid Jetty provider context length");
+        std::vector<uint8_t> context(static_cast<size_t>(env->GetArrayLength(providerContext)));
+        if (!context.empty()) env->GetByteArrayRegion(providerContext, 0,
+            static_cast<jsize>(context.size()), reinterpret_cast<jbyte*>(context.data()));
+        if (env->ExceptionCheck()) return;
+        transport->connect(remote, context);
     } catch (const std::exception& e) {
         THROW_CONN(env, e.what());
     }
@@ -237,10 +247,15 @@ Java_org_scache_network_ub_UrmaNative_nativeGetLocalEndpoint(
 
         EndpointDescriptor net_ep = ep;
         net_ep.to_network();
-        jbyteArray result = env->NewByteArray(static_cast<jsize>(sizeof(net_ep)));
+        const auto context = transport->export_jetty_context();
+        std::vector<uint8_t> wire(sizeof(net_ep));
+        std::memcpy(wire.data(), &net_ep, sizeof(net_ep));
+        for (int i = 3; i >= 0; --i) wire.push_back(static_cast<uint8_t>(context.size() >> (i*8)));
+        wire.insert(wire.end(), context.begin(), context.end());
+        jbyteArray result = env->NewByteArray(static_cast<jsize>(wire.size()));
         if (result == nullptr) return nullptr;
-        env->SetByteArrayRegion(result, 0, static_cast<jsize>(sizeof(net_ep)),
-                                reinterpret_cast<const jbyte*>(&net_ep));
+        env->SetByteArrayRegion(result, 0, static_cast<jsize>(wire.size()),
+                                reinterpret_cast<const jbyte*>(wire.data()));
         if (env->ExceptionCheck()) return nullptr;
         return result;
     } catch (const std::exception& e) {
@@ -345,6 +360,20 @@ Java_org_scache_network_ub_UrmaNative_nativeRegisterBuffer(
     } catch (const std::exception& e) {
         THROW_URMA(env, e.what());
         return nullptr;
+    }
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_org_scache_network_ub_UrmaNative_nativeGetSegmentContext(
+    JNIEnv* env, jclass, jlong handle, jlong regionHandle) {
+    try {
+        auto context = get_transport(handle)->export_segment_context(static_cast<uint64_t>(regionHandle));
+        jbyteArray result = env->NewByteArray(static_cast<jsize>(context.size()));
+        if (result && !context.empty()) env->SetByteArrayRegion(result, 0,
+            static_cast<jsize>(context.size()), reinterpret_cast<const jbyte*>(context.data()));
+        return result;
+    } catch (const std::exception& e) {
+        THROW_URMA(env, e.what()); return nullptr;
     }
 }
 

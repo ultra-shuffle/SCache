@@ -1139,7 +1139,7 @@ private[ub] object UBBlockTransferService {
   // GC to reclaim memory still exposed to a peer. No timer discards this set.
   private val quarantinedServices = java.util.concurrent.ConcurrentHashMap
     .newKeySet[UBBlockTransferService]()
-  private val ControlProtocolVersion = 2
+  private val ControlProtocolVersion = 3
   private val ControlHeaderBytes = 17L // opcode + protocol version + request/correlation id + length
   private val MaxControlFrame = 64 * 1024
   private[ub] def validateControlHeader(
@@ -1216,13 +1216,17 @@ private[ub] object UBBlockTransferService {
     out.writeLong(d.baseAddress); out.writeInt(d.offset); out.writeLong(d.remoteAddress); out.writeInt(d.length)
     out.writeInt(d.token); out.writeLong(d.segmentGeneration); out.writeLong(d.generation); out.writeLong(d.crc)
     putString(out, d.leaseId); putString(out, d.blockId)
-    out.write(d.segment.toBytes())
+    val segment = d.segment.toBytes()
+    out.writeInt(segment.length); out.write(segment)
   }
   private def getDescriptor(in: DataInputStream): Descriptor = {
     val version = in.readInt(); if (version != ControlProtocolVersion) throw new IllegalArgumentException(s"unsupported descriptor protocol $version")
     val d = Descriptor(version, getString(in), in.readLong(), getString(in), in.readLong(), in.readInt(), in.readLong(),
       in.readInt(), in.readInt(), in.readLong(), in.readLong(), in.readLong(), getString(in), getString(in))
-    val bytes = new Array[Byte](SegmentDescriptor.WIRE_BYTES)
+    val n = in.readInt()
+    if (n < SegmentDescriptor.WIRE_BYTES + 4 || n > SegmentDescriptor.WIRE_BYTES + 4 + SegmentDescriptor.MAX_PROVIDER_CONTEXT)
+      throw new IllegalArgumentException("invalid segment context size")
+    val bytes = new Array[Byte](n)
     in.readFully(bytes)
     d.copy(segment = SegmentDescriptor.fromBytes(bytes))
   }
@@ -1263,9 +1267,10 @@ private[ub] object UBBlockTransferService {
   }
 
   private[ub] def runProtocolContracts(): Seq[(String, Boolean)] = {
+    val providerContext = Array.tabulate[Byte](4096)(i => (i * 31).toByte)
     val d = Descriptor(ControlProtocolVersion, "node", 7L, "arena", 0x1000L, 16, 0x1010L, 64, 3, 42L, 9L, 123L,
       "lease", "scache_contract_1_1_0_0",
-      new SegmentDescriptor(new Array[Byte](16), 17, 0, 0x1000L, 4096L, 3, 42L))
+      new SegmentDescriptor(new Array[Byte](16), 17, 0, 0x1000L, 4096L, 3, 42L, providerContext))
     val messages: Seq[(String, Message)] = Seq(
       "hello" -> Hello("node", 7L, new Array[Byte](64)), "capabilities" -> Capabilities,
       "acquire" -> Acquire(d.blockId), "acquired" -> Grant(d), "not_found" -> NotFound,
@@ -1278,6 +1283,10 @@ private[ub] object UBBlockTransferService {
     messages.foreach { case (name, message) =>
       val raw = encode(message)
       results += name -> java.util.Arrays.equals(raw, encode(decode(message.kind, raw)))
+    }
+    results += "provider_context_preserved" -> {
+      val decoded = decode(Grant(d).kind, encode(Grant(d))).asInstanceOf[Grant]
+      java.util.Arrays.equals(providerContext, decoded.descriptor.segment.providerContext())
     }
     def rejected(name: String)(body: => Unit): Unit = {
       var ok = false; try body catch { case _: IllegalArgumentException | _: IllegalStateException => ok = true }

@@ -54,7 +54,9 @@ public:
 
     // ---- Lifecycle (caller thread, before owner loop starts) ----
     void init(const TransportOptions& options);
-    void connect(const EndpointDescriptor& remote);
+    void connect(const EndpointDescriptor& remote, const std::vector<uint8_t>& provider_context = {});
+    std::vector<uint8_t> export_jetty_context();
+    std::vector<uint8_t> export_segment_context(uint64_t handle);
     void close();
     static void shutdown_process_runtime();
     static ProcessRuntimeMetrics process_runtime_metrics();

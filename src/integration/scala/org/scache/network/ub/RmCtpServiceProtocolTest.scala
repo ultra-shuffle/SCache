@@ -17,6 +17,7 @@ import org.scache.util.ScacheConf
 object RmCtpServiceProtocolTest {
   private val seq = new AtomicLong(1)
   private val memory = new ConcurrentHashMap[Long, ByteBuffer]()
+  private val context = Array.tabulate[Byte](4096)(i => (i * 31).toByte)
   private class CopyTransport extends UbTransport {
     var rejectNextRead = false
     var corruptNextRead = false
@@ -29,15 +30,18 @@ object RmCtpServiceProtocolTest {
     private var closed = false
     private val ep = new EndpointDescriptor()
     ep.transportMode = 1; ep.tpType = 1; ep.jettyId = seq.getAndIncrement().toInt
+    ep.providerContext = context.clone()
     override def capabilities(): UbTransportCapabilities = RealUbTransport.capabilitiesFor(32, 4096)
     override def localEndpoint(): Array[Byte] = ep.toBytes()
-    override def connect(raw: Array[Byte]): Unit = { EndpointDescriptor.fromBytes(raw); () }
+    override def connect(raw: Array[Byte]): Unit = {
+      require(java.util.Arrays.equals(EndpointDescriptor.fromBytes(raw).providerContext, context), "Jetty context lost in HELLO")
+    }
     override def registerBuffer(b: ByteBuffer): UbRegisteredBuffer = synchronized {
       // Exercise the full descriptor/control/read path with a valid UBVA whose
       // high bit is set. Java represents this unsigned address as a negative long.
       val id = seq.getAndIncrement(); val address = Long.MinValue + id * 0x1000000L
       memory.put(address, b); owned += address
-      val mr = new SegmentDescriptor(new Array[Byte](16), ep.jettyId, 0, address, b.capacity(), 1, id)
+      val mr = new SegmentDescriptor(new Array[Byte](16), ep.jettyId, 0, address, b.capacity(), 1, id, context)
       new UbRegisteredBuffer(this, b, id, id, b, address, b.capacity(), 1, mr)
     }
     override def unregisterBuffer(b: UbRegisteredBuffer): Unit = synchronized {
@@ -51,6 +55,7 @@ object RmCtpServiceProtocolTest {
       }
       val window = RealUbTransport.window(r, offset, n)
       require(window.segment != null)
+      require(java.util.Arrays.equals(window.segment.providerContext(), context), "MR context lost in GRANT")
       val source = Option(memory.get(window.segment.address)).getOrElse(sys.error("unknown test MR"))
       val start = Math.toIntExact(window.remoteAddress - window.segment.address)
       val src = source.duplicate(); src.position(start); src.limit(start + n)

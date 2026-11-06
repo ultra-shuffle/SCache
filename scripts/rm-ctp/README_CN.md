@@ -146,4 +146,4 @@ bash scripts/rm-ctp/run-node.sh B "$TEST_WORK/node-B" \
 
 遇到`ERR_DMA_UNRESOLVED`或`UB_CLOSE_QUARANTINED`，不得将失败当作普通可重试读写，也不要在同一进程释放/复用池。保留日志，确认provider排空或厂商进程退出资源撤销机制后再重新测试；当前实验实现没有自动恢复承诺。
 
-原10–70部署脚本及其RC门禁没有修改。不要直接绕过旧脚本门禁或把本分支JNI单独替换到原U1 JAR中：控制协议2与JNI API3要求两端Java/Scala/JNI一起更新。
+原10–70部署脚本及其RC门禁没有修改。本独立副本已加入聚合完整上下文交换，控制协议为3、JNI API为4；两端Java/Scala/JNI必须一起更新，不能只替换旧包中的`.so`。六月SDK要求、修改依据及VM验证见本源码副本上层的`README_CN.md`。

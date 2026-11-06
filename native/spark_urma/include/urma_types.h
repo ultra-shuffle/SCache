@@ -57,6 +57,7 @@ struct RemoteRegion {
     uint64_t segment_address = 0;
     uint64_t segment_length = 0;
     bool has_segment = false;
+    std::vector<uint8_t> provider_context;
 };
 
 // ---- Completion result ----
@@ -88,7 +89,7 @@ struct ProcessRuntimeMetrics {
 
 // ---- Endpoint descriptor exchanged via control channel ----
 struct EndpointDescriptor {
-    uint32_t protocol_version = 2;
+    uint32_t protocol_version = 3;
     uint32_t uasid = 0;
     uint32_t jetty_id = 0;
     uint32_t tp_type = 0;   // former padding, explicitly negotiated in protocol 2
@@ -112,8 +113,9 @@ struct EndpointDescriptor {
 };
 
 // ---- Protocol versions ----
-static constexpr uint32_t PROTOCOL_VERSION = 2;
-static_assert(sizeof(EndpointDescriptor) == 88, "endpoint protocol 2 layout must be 88 bytes");
+static constexpr uint32_t PROTOCOL_VERSION = 3;
+// The JNI wire format appends a length and opaque context to this fixed identity.
+static_assert(sizeof(EndpointDescriptor) == 88, "endpoint base identity must remain 88 bytes");
 
 // ---- Error codes ----
 enum class ErrorCode : int32_t {

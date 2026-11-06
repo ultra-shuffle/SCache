@@ -4,7 +4,7 @@ package org.scache.network.ub;
 public final class RmCtpJniAbiTest {
     public static void main(String[] args) {
         UrmaNative.ensureLoaded();
-        if (UrmaNative.nativeApiVersion() != 3) throw new AssertionError("wrong JNI ABI");
+        if (UrmaNative.nativeApiVersion() != 4) throw new AssertionError("wrong JNI ABI");
         boolean invalidModeRejected = false;
         try {
             UrmaNative.nativeInitV2("not-a-device", 8, 4096, true, 2, 1, 0, 6, 10, 10);
@@ -14,8 +14,8 @@ public final class RmCtpJniAbiTest {
         if (!invalidModeRejected) throw new AssertionError("invalid mode reached provider initialization");
         boolean invalidHandleRejected = false;
         try {
-            UrmaNative.nativeConnectV2(0, new byte[16], 0, 1, 4096, 0, 1,
-                4096, 64, -1, 2, 1, 1, new byte[16]);
+            UrmaNative.nativeConnectV3(0, new byte[16], 0, 1, 4096, 0, 1,
+                4096, 64, -1, 3, 1, 1, new byte[16], new byte[0]);
         } catch (UrmaConnectionException e) {
             invalidHandleRejected = e.getMessage().contains("Null native handle");
         }

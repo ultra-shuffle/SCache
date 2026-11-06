@@ -50,6 +50,27 @@ set(SPARK_URMA_BOND_CONTEXT_API ${SPARK_URMA_BOND_CONTEXT_API}
     CACHE INTERNAL "Paired SDK explicit bonding-context support" FORCE)
 message(STATUS "Paired SDK explicit bonding-context API: ${SPARK_URMA_BOND_CONTEXT_API}")
 
+# June-24/B103 context layout. Newer SDKs use a different user-info ABI:
+# never reinterpret one layout as the other or silently use the legacy path.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES "${URMA_INC}")
+set(CMAKE_REQUIRED_LIBRARIES "${URMA_LIBRARY};${URMA_COMMON_LIBRARY}")
+unset(SPARK_URMA_JUNE_CONTEXT_API CACHE)
+check_cxx_source_compiles("
+    #include <urma_api.h>
+    int main() {
+        urma_rjetty_t j = {}; urma_seg_t s = {};
+        j.ext.flag.bs.enable = 1; s.ext.flag.bs.enable = 1;
+        auto volatile a = &urma_get_rjetty; auto volatile b = &urma_put_rjetty;
+        auto volatile c = &urma_get_seg_ctx; auto volatile d = &urma_put_seg_ctx;
+        return a == nullptr || b == nullptr || c == nullptr || d == nullptr;
+    }" SPARK_URMA_JUNE_CONTEXT_API)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
+file(SHA256 "${URMA_INC}/urma_api.h" URMA_API_SHA)
+file(SHA256 "${URMA_INC}/urma_types.h" URMA_TYPES_SHA)
+string(SHA256 SPARK_URMA_SDK_FINGERPRINT "${URMA_API_SHA}:${URMA_TYPES_SHA}:${CMAKE_SYSTEM_PROCESSOR}")
+
 # ---- JNI headers (the library does not link libjvm/AWT) ----
 set(JAVA_HOME "$ENV{JAVA_HOME}" CACHE PATH "JDK root")
 if(NOT JAVA_HOME)
@@ -83,7 +104,9 @@ target_include_directories(spark_urma_obj PRIVATE
 )
 target_compile_features(spark_urma_obj PUBLIC cxx_std_17)
 target_compile_definitions(spark_urma_obj PRIVATE
-    SPARK_URMA_BOND_CONTEXT_API=${SPARK_URMA_BOND_CONTEXT_API})
+    SPARK_URMA_BOND_CONTEXT_API=${SPARK_URMA_BOND_CONTEXT_API}
+    SPARK_URMA_JUNE_CONTEXT_API=$<BOOL:${SPARK_URMA_JUNE_CONTEXT_API}>
+    SPARK_URMA_SDK_FINGERPRINT="${SPARK_URMA_SDK_FINGERPRINT}")
 target_compile_options(spark_urma_obj PRIVATE -Wall -Wextra -Werror)
 set_target_properties(spark_urma_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -113,6 +136,19 @@ install(TARGETS SparkUrma LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 option(BUILD_TESTS "Build standalone tests" ON)
 if(BUILD_TESTS)
     enable_testing()
+    if(SPARK_URMA_JUNE_CONTEXT_API)
+        add_executable(provider_context_test tests/provider_context_test.cpp $<TARGET_OBJECTS:spark_urma_obj>)
+        target_include_directories(provider_context_test PRIVATE include src "${URMA_INC}")
+        target_compile_options(provider_context_test PRIVATE -Wall -Wextra -Werror)
+        target_compile_definitions(provider_context_test PRIVATE SPARK_URMA_JUNE_CONTEXT_API=1
+            SPARK_URMA_SDK_FINGERPRINT="${SPARK_URMA_SDK_FINGERPRINT}")
+        target_link_libraries(provider_context_test PRIVATE ${URMA_LIBRARY} ${URMA_COMMON_LIBRARY} pthread ${CMAKE_DL_LIBS})
+        foreach(api get_rjetty put_rjetty get_seg_ctx put_seg_ctx import_jetty import_seg post_jetty_send_wr poll_jfc)
+            target_link_options(provider_context_test PRIVATE "-Wl,--wrap=urma_${api}")
+        endforeach()
+        add_test(NAME provider_context_test COMMAND provider_context_test)
+        set_tests_properties(provider_context_test PROPERTIES LABELS "offline-context" TIMEOUT 15)
+    endif()
     foreach(contract local_va_contract_test rm_ctp_dma_lifetime_test rm_ctp_post_ownership_test rm_ctp_mr_import_test rm_ctp_connect_test rm_ctp_init_test registration_diagnostics_test)
         add_executable(${contract} tests/${contract}.cpp $<TARGET_OBJECTS:spark_urma_obj>)
         target_include_directories(${contract} PRIVATE

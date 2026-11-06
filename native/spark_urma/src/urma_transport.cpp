@@ -19,6 +19,8 @@ extern "C" {
 #endif
 }
 
+#include "provider_context.h"
+
 namespace spark_urma {
 namespace {
 std::mutex g_process_mutex;
@@ -317,11 +319,77 @@ ProcessRuntimeMetrics UrmaTransport::process_runtime_metrics() {
     return metrics;
 }
 
-void UrmaTransport::connect(const EndpointDescriptor& remote) {
+std::vector<uint8_t> UrmaTransport::export_jetty_context() {
+    LOCK();
+    if (state_ != TransportState::INITIALIZED && state_ != TransportState::CONNECTED)
+        throw std::runtime_error("ERR_CONNECTION: context export requires an open transport");
+    if (options_.device_name.compare(0, 7, "bonding") != 0) return {};
+#if SPARK_URMA_JUNE_CONTEXT_API
+    urma_rjetty_t* context = nullptr;
+    uint32_t length = 0;
+    const auto status = urma_get_rjetty(jetty_, &context, &length);
+    std::unique_ptr<urma_rjetty_t, decltype(&urma_put_rjetty)> owner(context, &urma_put_rjetty);
+    if (status != URMA_SUCCESS || !context || length < sizeof(*context) ||
+        !context->ext.flag.bs.enable || context->ext.length == 0 ||
+        length > CONTEXT_LIMIT-CONTEXT_HEADER || context->ext.length != length-sizeof(*context))
+        throw std::runtime_error("ERR_CONNECTION: urma_get_rjetty did not export a complete bonding context");
+    // June core leaves tp_type zero. Preserve the selected mode, as official perftest does.
+    context->tp_type = static_cast<urma_tp_type_t>(options_.tp_type);
+    return pack_context(context, length, 1, sizeof(*context));
+#else
+    throw std::runtime_error("ERR_CAPABILITY: bonding context exchange requires paired June/B103 get/put context APIs");
+#endif
+}
+
+std::vector<uint8_t> UrmaTransport::export_segment_context(uint64_t handle) {
+    LOCK();
+    auto it = registered_regions_.find(handle);
+    if (it == registered_regions_.end() || !it->second.registered)
+        throw std::runtime_error("ERR_REGISTRATION: cannot export an unknown segment");
+    if (options_.device_name.compare(0, 7, "bonding") != 0) return {};
+#if SPARK_URMA_JUNE_CONTEXT_API
+    urma_seg_t* context = nullptr;
+    uint32_t length = 0;
+    const auto status = urma_get_seg_ctx(it->second.segment, &context, &length);
+    std::unique_ptr<urma_seg_t, decltype(&urma_put_seg_ctx)> owner(context, &urma_put_seg_ctx);
+    if (status != URMA_SUCCESS || !context || length < sizeof(*context) ||
+        !context->ext.flag.bs.enable || context->ext.length == 0 ||
+        length > CONTEXT_LIMIT-CONTEXT_HEADER || context->ext.length != length-sizeof(*context))
+        throw std::runtime_error("ERR_CONNECTION: urma_get_seg_ctx did not export a complete bonding context");
+    return pack_context(context, length, 2, sizeof(*context));
+#else
+    throw std::runtime_error("ERR_CAPABILITY: bonding context exchange requires paired June/B103 get/put context APIs");
+#endif
+}
+
+void UrmaTransport::connect(const EndpointDescriptor& remote, const std::vector<uint8_t>& provider_context) {
     LOCK();
     if (remote.protocol_version != PROTOCOL_VERSION || remote.max_chunk_bytes == 0 ||
         remote.transport_mode != options_.transport_mode || remote.tp_type != options_.tp_type) {
         throw std::runtime_error("ERR_PROTOCOL: incompatible endpoint version/mode/TP/limit");
+    }
+    // Validate a prospective peer before releasing the previous peer's resources.
+    urma_rjetty_t remote_jetty = {};
+    std::memcpy(&remote_jetty.jetty_id.eid, remote.eid, sizeof(remote.eid));
+    remote_jetty.jetty_id.uasid = remote.uasid;
+    remote_jetty.jetty_id.id = remote.jetty_id;
+    remote_jetty.trans_mode = static_cast<urma_transport_mode_t>(options_.transport_mode);
+    remote_jetty.tp_type = static_cast<urma_tp_type_t>(options_.tp_type);
+    remote_jetty.type = URMA_JETTY;
+    ContextPtr<urma_rjetty_t> full_context(nullptr, &std::free);
+    if (options_.device_name.compare(0, 7, "bonding") == 0) {
+#if SPARK_URMA_JUNE_CONTEXT_API
+        full_context = unpack_context<urma_rjetty_t>(provider_context, 1);
+        if (std::memcmp(&full_context->jetty_id.eid, remote.eid, 16) != 0 ||
+            full_context->jetty_id.uasid != remote.uasid || full_context->jetty_id.id != remote.jetty_id ||
+            full_context->trans_mode != remote_jetty.trans_mode || full_context->type != URMA_JETTY)
+            throw std::runtime_error("ERR_PROTOCOL: exported Jetty context disagrees with peer identity/mode");
+        full_context->tp_type = remote_jetty.tp_type;
+#else
+        throw std::runtime_error("ERR_CAPABILITY: paired bonding context APIs unavailable");
+#endif
+    } else if (!provider_context.empty()) {
+        throw std::runtime_error("ERR_PROTOCOL: bonding context cannot be imported by a physical-device transport");
     }
     if (state_ == TransportState::CONNECTED) {
         for (const auto& item : requests_) {
@@ -377,16 +445,9 @@ void UrmaTransport::connect(const EndpointDescriptor& remote) {
         effective_max_raw_operation_bytes_);
     std::fprintf(stderr, "SPARK_URMA_CONNECT peer_jetty=%u peer_uasid=%u mode=%u tp=%u\n",
         remote.jetty_id, remote.uasid, remote.transport_mode, remote.tp_type);
-    urma_rjetty_t remote_jetty = {};
-    std::memcpy(&remote_jetty.jetty_id.eid, remote.eid, sizeof(remote.eid));
-    remote_jetty.jetty_id.uasid = remote.uasid;
-    remote_jetty.jetty_id.id = remote.jetty_id;
-    remote_jetty.trans_mode = static_cast<urma_transport_mode_t>(options_.transport_mode);
-    remote_jetty.tp_type = static_cast<urma_tp_type_t>(options_.tp_type);
-    remote_jetty.type = URMA_JETTY;
     urma_token_t token = {.token = 0xDEADBEEF};
     errno = 0;
-    remote_jetty_ = urma_import_jetty(ctx_, &remote_jetty, &token);
+    remote_jetty_ = urma_import_jetty(ctx_, full_context ? full_context.get() : &remote_jetty, &token);
     if (remote_jetty_ == nullptr) throw std::runtime_error(
         "ERR_CONNECTION: " + provider_failure("urma_import_jetty", options_, errno));
     if (options_.transport_mode == URMA_TM_RC && urma_bind_jetty(jetty_, remote_jetty_) != URMA_SUCCESS) {
@@ -599,6 +660,7 @@ UrmaTransport::ImportedRegionState& UrmaTransport::find_or_import_remote_locked(
             imported.region.segment_attributes == remote.segment_attributes &&
             std::memcmp(imported.region.segment_eid, remote.segment_eid, 16) == 0 &&
             imported.region.token == remote.token &&
+            imported.region.provider_context == remote.provider_context &&
             imported.region.generation == remote.generation) {
             imported.last_used = ++import_clock_;
             return imported;
@@ -629,6 +691,21 @@ UrmaTransport::ImportedRegionState& UrmaTransport::find_or_import_remote_locked(
     segment.len = remote.segment_length;
     segment.attr.value = remote.segment_attributes;
     segment.token_id = static_cast<uint32_t>(remote.token);
+    ContextPtr<urma_seg_t> full_context(nullptr, &std::free);
+    if (options_.device_name.compare(0, 7, "bonding") == 0) {
+#if SPARK_URMA_JUNE_CONTEXT_API
+        full_context = unpack_context<urma_seg_t>(remote.provider_context, 2);
+        if (std::memcmp(&full_context->ubva.eid, remote.segment_eid, 16) != 0 ||
+            full_context->ubva.uasid != segment.ubva.uasid || full_context->ubva.va != segment.ubva.va ||
+            full_context->len != segment.len || full_context->attr.value != segment.attr.value ||
+            full_context->token_id != segment.token_id)
+            throw std::runtime_error("ERR_PROTOCOL: exported segment context disagrees with MR identity");
+#else
+        throw std::runtime_error("ERR_CAPABILITY: paired bonding context APIs unavailable");
+#endif
+    } else if (!remote.provider_context.empty()) {
+        throw std::runtime_error("ERR_PROTOCOL: bonding context cannot be imported by a physical-device transport");
+    }
     urma_token_t token = {.token = 0xDEADBEEF};
     urma_import_seg_flag_t import_flags = {};
     import_flags.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
@@ -638,7 +715,7 @@ UrmaTransport::ImportedRegionState& UrmaTransport::find_or_import_remote_locked(
     imported_regions_.reserve(imported_regions_.size() + 1);
     errno = 0;
     urma_target_seg_t* imported = urma_import_seg(
-        ctx_, &segment, &token, 0, import_flags);
+        ctx_, full_context ? full_context.get() : &segment, &token, 0, import_flags);
     const int import_errno = errno;
     std::fprintf(stderr, "SPARK_URMA_IMPORT remote_seg_uasid=%u remote_eid=%02x%02x%02x%02x... addr=%#llx token=%llu seggen=%llu\n",
                  remote.segment_uasid, remote.segment_eid[0], remote.segment_eid[1], remote.segment_eid[2], remote.segment_eid[3],
