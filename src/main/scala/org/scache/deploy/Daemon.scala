@@ -33,6 +33,16 @@ case class DaemonEndpointConfig(
     clientPort: Option[Int] = None,
     correlationPrefix: String = "daemon")
 
+private[deploy] object DaemonRpcReplayPolicy {
+  private val statefulPoolOperations = Set(
+    "get-ipc", "get-ipc-batch", "release-imported-block", "prepare-put-pool",
+    "prepare-put", "prepare-put-batch", "commit-put-pool", "commit-put",
+    "commit-put-batch", "abort-put-pool")
+
+  def requiresOneShot(backend: String, operation: String): Boolean =
+    backend.equalsIgnoreCase("ub") && statefulPoolOperations.contains(operation)
+}
+
 class Daemon(
   scacheHome: String,
   platform: String,
@@ -126,13 +136,13 @@ class Daemon(
 
   private def askClient[T: ClassTag](operation: String, message: Any): T = {
     val correlationId = s"${endpointConfig.correlationPrefix}-$operation-${requestSequence.incrementAndGet()}"
-    // A pool fetch reserves a consumer and a release decrements its reference count.
-    // Neither operation is idempotent when the reply is lost: askWithRetry can execute
-    // the same message twice, leaking a reservation or freeing another reader's slice.
+    // Pool fetch/prepare reserve resources, commit changes publication state, and
+    // release/abort decrement references. A lost reply does not prove non-execution:
+    // askWithRetry must not replay these operations without an idempotency token.
     // Until the IPC protocol carries a per-consumer idempotency token, fail the
     // affected UB call on an ambiguous timeout instead of replaying it.
-    val oneShotUbPoolOperation = clientIdentity.backend.equalsIgnoreCase("ub") &&
-      Set("get-ipc", "get-ipc-batch", "release-imported-block").contains(operation)
+    val oneShotUbPoolOperation =
+      DaemonRpcReplayPolicy.requiresOneShot(clientIdentity.backend, operation)
     val totalAttempts = if (oneShotUbPoolOperation) 1 else RpcUtils.numRetries(conf)
     try {
       val result = if (oneShotUbPoolOperation) {
