@@ -206,7 +206,44 @@ int main() {
             "terminal order is bounded");
     require(cache_transport.requests_.size() <= UrmaTransport::MAX_TERMINAL_RESULTS,
             "terminal request cache is bounded");
-    std::puts("PASS request_state_test child_post_failure_2 close_drain_success "
+    // Window waits may retire only terminal, completely drained internal children.
+    UrmaTransport window_transport;
+    auto parent = request(900, 64);
+    parent.is_aggregate = true;
+    parent.state = RequestState::COMPLETED_SUCCESS;
+    parent.completed_bytes = 64;
+    parent.children = {901};
+    auto internal = request(901, 64);
+    internal.aggregate_parent = 900;
+    internal.state = RequestState::COMPLETED_SUCCESS;
+    internal.provider_outstanding = true;
+    window_transport.requests_.emplace(900, parent);
+    window_transport.requests_.emplace(901, internal);
+    window_transport.retire_drained_children_locked(window_transport.requests_.at(900));
+    require(window_transport.requests_.size() == 2, "provider-owned child must survive retirement");
+    window_transport.requests_.at(901).provider_outstanding = false;
+    window_transport.retire_drained_children_locked(window_transport.requests_.at(900));
+    require(window_transport.requests_.size() == 2, "unreleased memory reference must survive retirement");
+    window_transport.requests_.at(901).local_ref_released = true;
+    window_transport.retire_drained_children_locked(window_transport.requests_.at(900));
+    require(window_transport.requests_.size() == 1 && window_transport.requests_.at(900).children.empty(),
+            "drained aggregate children must not accumulate across windows");
+    require(window_transport.requests_.at(900).children.capacity() == 0,
+            "retired child vector storage must also be released");
+    require(window_transport.wait(900, 1).bytes == 64,
+            "aggregate result must survive child retirement and repeated wait");
+    // Missing child IDs in the terminal queue must be discarded, not requeued forever.
+    for (size_t i = 0; i <= UrmaTransport::MAX_TERMINAL_RESULTS; ++i)
+        window_transport.terminal_order_.push_back(901);
+    window_transport.trim_terminal_cache_locked();
+    require(window_transport.terminal_order_.size() <= UrmaTransport::MAX_TERMINAL_RESULTS,
+            "retired child IDs must not keep the terminal queue over its bound");
+    window_transport.requests_.at(900).children = {902};
+    window_transport.retire_drained_children_locked(window_transport.requests_.at(900));
+    require(!window_transport.requests_.at(900).children.empty(),
+            "missing ownership evidence must not be cleared");
+    window_transport.requests_.at(900).children.clear();
+    std::puts("PASS request_state_test drained_window_child_retirement child_post_failure_2 close_drain_success "
               "close_drain_timeout aggregate_failure child_timeout reverse_results "
               "unknown_request wait_after_timeout provider_drain remote_import_ref "
               "cleanup_guard terminal_cache");

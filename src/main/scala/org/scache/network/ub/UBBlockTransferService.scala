@@ -69,6 +69,10 @@ private[scache] class UBBlockTransferService(
   // and completion checks are intentionally unaffected.
   private val sharedPoolChecksumEnabled =
     conf.getBoolean("scache.ub.checksum.enabled", true)
+  // Zero retains whole-block scheduling. Large ordinary fetches reuse one registered
+  // scratch window; shared-pool fetches still own their complete final destination.
+  private val readWindowBytes = conf.getInt("scache.ub.readWindowBytes", 4 * 1024 * 1024)
+  require(readWindowBytes >= 0, "scache.ub.readWindowBytes must be non-negative")
   private val transportBackend =
     UbTransportFactory.normalizeBackend(conf.getString("scache.ub.transport", "real"))
   require(transportBackend == "real",
@@ -105,6 +109,9 @@ private[scache] class UBBlockTransferService(
   private val activeControlConnections = new AtomicLong(0L)
   private val lastNativeRequestId = new AtomicLong(0L)
   private val nextTransferId = new AtomicLong(1L)
+  private val readWindows = new AtomicLong(0L)
+  private val activeScratchReadBytes = new AtomicLong(0L)
+  private val peakScratchReadBytes = new AtomicLong(0L)
   private val traceEvents = new AtomicLong(0L)
 
   @volatile private var closed = false
@@ -720,17 +727,34 @@ private[scache] class UBBlockTransferService(
               s"length=${descriptor.length} token=${descriptor.token} generation=${descriptor.generation} " +
               s"crc=${descriptor.crc} leaseId=${descriptor.leaseId} leaseOwner=$nodeId/$epoch " +
               s"leaseTimeoutMs=$leaseTimeoutMs terminal=GRANT")
-            val local = localArena.allocateScratch(descriptor.length)
+            val scratchLength = if (readWindowBytes == 0) descriptor.length
+              else math.min(descriptor.length, readWindowBytes)
+            val local = localArena.allocateScratch(scratchLength)
+            val scratchInUse = activeScratchReadBytes.addAndGet(scratchLength.toLong)
+            peakScratchReadBytes.accumulateAndGet(scratchInUse, java.lang.Math.max)
             try {
-              transferRead(descriptor, local.buffer, transferId, blockId)
-              val actual = if (sharedPoolChecksumEnabled) crc(local.buffer, descriptor.length) else -1L
+              val copied = ByteBuffer.allocate(descriptor.length)
+              val check = if (sharedPoolChecksumEnabled) new CRC32() else null
+              foreachReadWindow(descriptor.length, scratchLength) { (offset, length) =>
+                transferLogical(length) { (innerOffset, partLength, index, count) =>
+                  val request = transport.read(descriptor.remote, offset.toLong + innerOffset,
+                    local.buffer, innerOffset, partLength)
+                  await(request, partLength, isRead = true)
+                  readWindows.incrementAndGet()
+                  trace(s"SCACHE_UB_LOGICAL_READ transferId=$transferId blockId=$blockId " +
+                    s"requestId=$request operationIndex=$index operationCount=$count " +
+                    s"offset=${offset.toLong + innerOffset} length=$partLength terminal=SUCCESS")
+                }
+                val source = local.buffer.duplicate(); source.position(0); source.limit(length)
+                if (check != null) check.update(source.duplicate())
+                copied.put(source)
+              }
+              copied.flip()
+              val actual = if (check != null) check.getValue else -1L
               if (sharedPoolChecksumEnabled && actual != descriptor.crc) {
                 checksumErrors.incrementAndGet()
                 throw new IllegalStateException(s"CRC mismatch for $blockId expected=${descriptor.crc} actual=$actual")
               }
-              val copied = ByteBuffer.allocate(descriptor.length)
-              val source = local.buffer.duplicate(); source.position(0); source.limit(descriptor.length)
-              copied.put(source); copied.flip()
               channel.exchange(Release(descriptor.leaseId, descriptor.generation)) match {
                 case Ack =>
                   trace(s"SCACHE_UB_FETCH_TERMINAL transferId=$transferId controlRequestId=${channel.lastExchangeId} " +
@@ -741,7 +765,10 @@ private[scache] class UBBlockTransferService(
                 case other => throw new IllegalStateException(s"unexpected RELEASE response $other")
               }
             } finally {
-              if (!dmaUnresolved) localArena.freeScratch(local)
+              if (!dmaUnresolved) {
+                localArena.freeScratch(local)
+                activeScratchReadBytes.addAndGet(-scratchLength.toLong)
+              }
             }
           } catch {
             case NonFatal(e) =>
@@ -806,12 +833,17 @@ private[scache] class UBBlockTransferService(
   /** Split a block into backend-neutral logical calls; one transport call remains one operation. */
   private def transferRead(
       descriptor: Descriptor, destination: ByteBuffer, transferId: String, blockId: String): Unit = {
-    transferLogical(descriptor.length) { (offset, length, index, count) =>
+    val window = if (readWindowBytes == 0) descriptor.length else readWindowBytes
+    foreachReadWindow(descriptor.length, window) { (windowOffset, windowLength) =>
+    transferLogical(windowLength) { (innerOffset, length, index, count) =>
+      val offset = windowOffset + innerOffset
       val request = transport.read(descriptor.remote, offset.toLong, destination, offset, length)
       await(request, length, isRead = true)
+      readWindows.incrementAndGet()
       trace(s"SCACHE_UB_LOGICAL_READ transferId=$transferId blockId=$blockId " +
         s"requestId=$request operationIndex=$index operationCount=$count offset=$offset " +
         s"length=$length terminal=SUCCESS")
+    }
     }
   }
 
@@ -1046,6 +1078,8 @@ private[scache] class UBBlockTransferService(
       Option(metric.backendCounters.get(name)).map(_.longValue()).getOrElse(0L)
     Map(
       "urma.blockReadRequests" -> readRequests.get(), "urma.blockWriteRequests" -> writeRequests.get(),
+      "urma.readWindows" -> readWindows.get(), "urma.activeScratchReadBytes" -> activeScratchReadBytes.get(),
+      "urma.peakScratchReadBytes" -> peakScratchReadBytes.get(),
       "urma.completedChunks" -> completedChunks.get(), "urma.failedChunks" -> failedChunks.get(),
       "urma.checksumErrors" -> checksumErrors.get(), "urma.leaseErrors" -> leaseErrors.get(),
       "urma.generationErrors" -> generationErrors.get(), "urma.tcpControlBytes" -> controlBytes.get(),
@@ -1385,9 +1419,21 @@ private[ub] object UBBlockTransferService {
     results.toSeq
   }
 
-  private def crc(buffer: ByteBuffer, length: Int): Long = {
+  private[ub] def foreachReadWindow(length: Int, window: Int)(operation: (Int, Int) => Unit): Unit = {
+    require(length >= 0 && (window > 0 || length == 0), "invalid read length/window")
+    var offset = 0
+    while (offset < length) {
+      val bytes = math.min(window, length - offset)
+      operation(offset, bytes)
+      offset = Math.addExact(offset, bytes)
+    }
+  }
+
+  private[ub] def crc(buffer: ByteBuffer, length: Int): Long = {
     val check = new CRC32(); val copy = buffer.duplicate(); copy.position(0); copy.limit(length)
-    while (copy.hasRemaining) check.update(copy.get() & 0xff)
+    // JDK's bulk implementation handles direct, heap and read-only buffers without
+    // changing the caller's position; avoid one Java CRC update per payload byte.
+    check.update(copy)
     check.getValue
   }
 

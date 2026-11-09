@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import scala.util.control.NonFatal
 import org.scache.storage.ScacheBlockId
 import org.scache.util.ScacheConf
+import org.scache.network.buffer.ManagedBuffer
+import org.scache.network.transfer.BlockFetchingListener
 
 /** Actual service/TCP/arena lifecycle with test-only in-JVM memory copying.
   * Not a UB provider, not DMA, and not a two-machine performance test.
@@ -19,6 +21,8 @@ object RmCtpServiceProtocolTest {
   private val memory = new ConcurrentHashMap[Long, ByteBuffer]()
   private val context = Array.tabulate[Byte](4096)(i => (i * 31).toByte)
   private class CopyTransport extends UbTransport {
+    val readRanges = scala.collection.mutable.ArrayBuffer.empty[(Long, Int, Int)]
+    var failReadNumber = 0
     var rejectNextRead = false
     var corruptNextRead = false
     var failNextCompletion = false
@@ -49,6 +53,9 @@ object RmCtpServiceProtocolTest {
       memory.remove(b.remoteAddress); b.markUnregistered(); ()
     }
     override def read(r: RemoteBuffer, offset: Long, dest: ByteBuffer, local: Int, n: Int): Long = synchronized {
+      readRanges += ((offset, local, n))
+      if (failReadNumber > 0 && readRanges.size == failReadNumber)
+        throw new IllegalStateException("TEST_WINDOW_READ_REJECTED_BEFORE_POST")
       if (rejectNextRead) {
         rejectNextRead = false
         throw new IllegalStateException("TEST_READ_REJECTED_BEFORE_POST")
@@ -87,7 +94,7 @@ object RmCtpServiceProtocolTest {
   private def field(service: UBBlockTransferService, name: String): java.lang.reflect.Field = {
     val f = classOf[UBBlockTransferService].getDeclaredField(name); f.setAccessible(true); f
   }
-  private def start(label: String, strict: Boolean = false): UBBlockTransferService = {
+  private def start(label: String, strict: Boolean = false, window: Int = 1048576): UBBlockTransferService = {
     val home = Files.createTempDirectory("scache-service-contract-")
     Files.createDirectory(home.resolve("conf")); Files.createDirectory(home.resolve("pool"))
     Files.writeString(home.resolve("conf/log4j.properties"), "log4j.rootLogger=OFF\n")
@@ -98,6 +105,7 @@ object RmCtpServiceProtocolTest {
     conf.set("spark.urma.transferTimeoutMs", "3000")
     conf.set("spark.urma.unpublishTimeoutMs", "1")
     conf.set("spark.urma.nodeId", label)
+    conf.set("scache.ub.readWindowBytes", window.toString)
     val s = new UBBlockTransferService(conf, "127.0.0.1", 1)
     val t = new CopyTransport
     val pool = new UBBlockTransferService.RegisteredArenaPool(t, 1048576, 3, label,
@@ -127,6 +135,8 @@ object RmCtpServiceProtocolTest {
     rejectedControlHandoffClosesSocket()
     allocationFailureReleasesSource()
     Seq("submit", "completion", "checksum").foreach(failedReadCanRetry)
+    Seq(0, 1024).foreach(ordinaryWindowReads)
+    failedMiddleWindowReleasesResources()
     val a = start("test-A"); val b = start("test-B")
     val sizes = Seq(64, 700000, 700001)
     val services = Seq(a, b)
@@ -178,6 +188,62 @@ object RmCtpServiceProtocolTest {
     shuffleCleanupRejectsLateOwnerCommit()
     applicationCleanupIsScoped()
     println("RM_CTP_SERVICE_PROTOCOL_PASS blocks=6 (two services; TCP control; test memory copy; NOT UB)")
+  }
+
+  private def ordinaryWindowReads(window: Int): Unit = {
+    val source = start("window-source-" + window)
+    val dest = start("window-dest-" + window, window = window)
+    val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+    try {
+      for (size <- Seq(0, 1, 1023, 1024, 1025, 4097)) {
+        val block = ScacheBlockId("window", 1, 1, window, size)
+        val bytes = Array.tabulate[Byte](size)(i => (i * 19).toByte)
+        source.publishBlock(block, bytes); copy.readRanges.clear()
+        var actual: Array[Byte] = null; var failure: Throwable = null
+        dest.fetchBlocks("127.0.0.1", source.port, "", Array(block.toString), new BlockFetchingListener {
+          override def onBlockFetchSuccess(id: String, buffer: ManagedBuffer): Unit = {
+            try { val b = buffer.nioByteBuffer(); actual = new Array[Byte](b.remaining()); b.get(actual) }
+            finally buffer.release()
+          }
+          override def onBlockFetchFailure(id: String, error: Throwable): Unit = { failure = error }
+        })
+        require(failure == null, String.valueOf(failure))
+        require(java.util.Arrays.equals(actual, bytes), "window content mismatch")
+        var offset = 0
+        copy.readRanges.foreach { case (remote, local, length) =>
+          require(remote == offset.toLong && local == 0)
+          require(length > 0 && (window == 0 || length <= window)); offset += length
+        }
+        require(offset == size)
+        require(dest.urmaMetrics("urma.activeScratchReadBytes") == 0)
+        require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+        require(source.urmaMetrics("urma.activeLeases") == 0)
+        source.unpublishBlock(block)
+      }
+      require(dest.urmaMetrics("urma.peakScratchReadBytes") == (if (window == 0) 4097 else 1024))
+      println(s"UB_ORDINARY_WINDOW_READ_PASS window=$window cases=6")
+    } finally { try source.close() finally dest.close() }
+  }
+
+  private def failedMiddleWindowReleasesResources(): Unit = {
+    val source = start("window-fault-source")
+    val dest = start("window-fault-dest", window = 1024)
+    val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+    val block = ScacheBlockId("window-fault", 1, 1, 0, 0)
+    try {
+      source.publishBlock(block, Array.fill[Byte](4097)(17)); copy.failReadNumber = 2
+      var failure: Throwable = null
+      dest.fetchBlocks("127.0.0.1", source.port, "", Array(block.toString), new BlockFetchingListener {
+        override def onBlockFetchSuccess(id: String, buffer: ManagedBuffer): Unit = sys.error("unexpected success")
+        override def onBlockFetchFailure(id: String, error: Throwable): Unit = { failure = error }
+      })
+      require(failure != null && copy.readRanges.size == 2)
+      require(dest.urmaMetrics("urma.activeScratchReadBytes") == 0)
+      require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+      source.unpublishBlock(block)
+      println("UB_MIDDLE_WINDOW_FAILURE_RELEASE_PASS")
+    } finally { try source.close() finally dest.close() }
   }
 
   private def rejectedControlHandoffClosesSocket(): Unit = {

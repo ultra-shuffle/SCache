@@ -195,6 +195,7 @@ private:
     void refresh_aggregates_locked();
     CompletionResult result_locked(const RequestRecord& request) const;
     bool provider_owned_locked(const RequestRecord& request) const;
+    void retire_drained_children_locked(RequestRecord& request);
     void trim_terminal_cache_locked();
     void cleanup_locked(std::vector<std::string>& errors);
 };

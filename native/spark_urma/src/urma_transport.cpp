@@ -1228,6 +1228,7 @@ void UrmaTransport::trim_terminal_cache_locked() {
         uint64_t id = terminal_order_.front();
         terminal_order_.pop_front();
         auto it = requests_.find(id);
+        if (it == requests_.end()) continue; // drained children may already be retired
         if (it != requests_.end() && it->second.state != RequestState::POSTED &&
             !provider_owned_locked(it->second) && it->second.aggregate_parent == 0) {
             for (uint64_t child_id : it->second.children) {
@@ -1250,6 +1251,24 @@ bool UrmaTransport::provider_owned_locked(const RequestRecord& request) const {
         if (child == requests_.end() || child->second.provider_outstanding) return true;
     }
     return false;
+}
+
+void UrmaTransport::retire_drained_children_locked(RequestRecord& request) {
+    if (!request.is_aggregate || request.state == RequestState::POSTED ||
+        request.state == RequestState::CREATED || provider_owned_locked(request)) return;
+    // Child IDs are internal to an aggregate. Keep the aggregate's public result,
+    // but do not carry every completed raw WR into later window waits. A CQ timeout
+    // or missing/mismatched bookkeeping must retain the entire ownership chain.
+    for (uint64_t id : request.children) {
+        auto child = requests_.find(id);
+        if (child == requests_.end() || child->second.aggregate_parent != request.request_id ||
+            child->second.is_aggregate || child->second.aggregate_building ||
+            !child->second.local_ref_released || child->second.remote_segment != nullptr ||
+            child->second.state == RequestState::POSTED ||
+            child->second.state == RequestState::CREATED) return;
+    }
+    for (uint64_t id : request.children) requests_.erase(id);
+    std::vector<uint64_t>().swap(request.children);
 }
 
 CompletionResult UrmaTransport::wait(uint64_t request_id, uint32_t timeout_ms) {
@@ -1280,7 +1299,10 @@ CompletionResult UrmaTransport::wait(uint64_t request_id, uint32_t timeout_ms) {
             const bool terminal = it->second.state != RequestState::POSTED &&
                                   it->second.state != RequestState::CREATED;
             if (terminal) {
-                if (!provider_owned_locked(it->second)) return result_locked(it->second);
+                if (!provider_owned_locked(it->second)) {
+                    retire_drained_children_locked(it->second);
+                    return result_locked(it->second);
+                }
                 if (drain_deadline == std::chrono::steady_clock::time_point::max()) {
                     drain_deadline = now + std::chrono::milliseconds(options_.drain_timeout_ms);
                 }
