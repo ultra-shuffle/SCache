@@ -473,6 +473,13 @@ class BlockManagerMasterEndpoint(
     } else {
       releaseCxlBlocksForAppShuffle(appName, shuffleId, jobId)
     }
+    removeMasterBlockMetadata {
+      case block: ScacheBlockId =>
+        block.shuffleId == shuffleId &&
+          (appName == null || appName.isEmpty || block.app == appName) &&
+          (jobId < 0 || block.jobId == jobId)
+      case _ => false
+    }
     val removeMsg = RemoveShuffle(shuffleId, Option(appName).getOrElse(""), jobId)
     Future.sequence(
       blockManagerInfo.values.map { bm =>
@@ -483,12 +490,31 @@ class BlockManagerMasterEndpoint(
 
   private def removeApplication(appName: String): Future[Seq[Int]] = {
     releaseCxlBlocksForApplication(appName)
+    removeMasterBlockMetadata {
+      case block: ScacheBlockId =>
+        appName == null || appName.isEmpty || block.app == appName
+      case _ => false
+    }
     val removeMsg = RemoveApplication(appName)
     Future.sequence(
       blockManagerInfo.values.map { bm =>
         bm.slaveEndpoint.ask[Int](removeMsg)
       }.toSeq
     )
+  }
+
+  /** Slaves remove shuffle blocks with tellMaster=false, so retire both master
+   * indexes here, as removeRdd already does. Snapshot keys before modifying the
+   * Java map; the endpoint dispatcher serializes updates to these indexes.
+   */
+  private def removeMasterBlockMetadata(matches: BlockId => Boolean): Unit = {
+    val removed = blockLocations.keySet().asScala.iterator.filter(matches).toVector
+    removed.foreach { blockId =>
+      val locations = blockLocations.remove(blockId)
+      if (locations != null) {
+        locations.foreach(id => blockManagerInfo.get(id).foreach(_.removeBlock(blockId)))
+      }
+    }
   }
 
   private def releaseCxlBlocksForShuffle(shuffleId: Int): Unit = {
