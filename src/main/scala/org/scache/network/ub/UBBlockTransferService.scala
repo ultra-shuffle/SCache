@@ -5,7 +5,7 @@
  */
 package org.scache.network.ub
 
-import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream, EOFException, File}
+import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream, EOFException, File, IOException}
 import java.net.{InetAddress, InetSocketAddress, ServerSocket, Socket}
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -13,7 +13,7 @@ import java.nio.channels.FileChannel.MapMode
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths, StandardOpenOption}
 import java.util.UUID
-import java.util.concurrent.{ExecutorService, Executors}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, ExecutorService, Executors, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.CRC32
 
@@ -107,6 +107,12 @@ private[scache] class UBBlockTransferService(
   private val sharedPoolMultiConsumerReservations = new AtomicLong(0L)
   private val sharedPoolDeferredReleases = new AtomicLong(0L)
   private val activeControlConnections = new AtomicLong(0L)
+  private val controlConnectionsCreated = new AtomicLong(0L)
+  private val controlConnectionReuses = new AtomicLong(0L)
+  private val inboundControlSockets = ConcurrentHashMap.newKeySet[Socket]()
+  private val controlConnectionsPerPeer =
+    math.max(1, conf.getInt("scache.ub.controlConnectionsPerPeer", 4))
+  private val controlPools = mutable.HashMap.empty[(String, Int), ControlPool]
   private val lastNativeRequestId = new AtomicLong(0L)
   private val nextTransferId = new AtomicLong(1L)
   private val readWindows = new AtomicLong(0L)
@@ -913,11 +919,13 @@ private[scache] class UBBlockTransferService(
   private def acceptLoop(): Unit = while (!closed) {
     try {
       val socket = server.accept()
+      inboundControlSockets.add(socket)
       try workers.execute(() => serve(socket))
       catch {
         case NonFatal(e) =>
           // close() may shut down the executor after accept() returned a socket.
           // A rejected handoff must not leave that control connection open.
+          inboundControlSockets.remove(socket)
           try socket.close() catch { case NonFatal(_) => () }
           throw e
       }
@@ -986,29 +994,117 @@ private[scache] class UBBlockTransferService(
     } finally {
       if (ownerKey != null && arena != null) arena.releaseOwner(ownerKey)
       try socket.close() catch { case NonFatal(_) => }
+      inboundControlSockets.remove(socket)
       activeControlConnections.decrementAndGet()
     }
   }
 
-  private def withControl[T](host: String, remotePort: Int)(body: (ControlChannel, PeerIdentity) => T): T = {
+  private final class CachedControl(
+      val socket: Socket, val channel: ControlChannel, val peer: PeerIdentity) {
+    var uses = 0
+  }
+
+  private def openControl(host: String, remotePort: Int): CachedControl = {
     val socket = new Socket()
+    var established = false
     try {
       socket.connect(new InetSocketAddress(host, remotePort), timeoutMs)
       socket.setSoTimeout(timeoutMs)
       val channel = new ControlChannel(socket)
-      channel.exchange(Hello(nodeId, epoch, endpoint.clone())) match {
+      val peer = channel.exchange(Hello(nodeId, epoch, endpoint.clone())) match {
         case Hello(remoteNode, remoteEpoch, remoteEndpoint) =>
           ensureConnected(remoteEndpoint)
-          val peer = PeerIdentity(remoteNode, remoteEpoch)
-          channel.exchange(Capabilities) match {
-            case Capabilities => body(channel, peer)
-            case ErrorResponse(message) => throw new IllegalStateException(message)
-            case other => throw new IllegalStateException(s"CAPABILITIES failed: $other")
-          }
+          PeerIdentity(remoteNode, remoteEpoch)
         case ErrorResponse(message) => throw new IllegalStateException(message)
         case other => throw new IllegalStateException(s"HELLO failed: $other")
       }
-    } finally socket.close()
+      checkControl(channel)
+      val result = new CachedControl(socket, channel, peer)
+      established = true
+      controlConnectionsCreated.incrementAndGet()
+      result
+    } finally if (!established) socket.close()
+  }
+
+  private def checkControl(channel: ControlChannel): Unit = channel.exchange(Capabilities) match {
+    case Capabilities => ()
+    case ErrorResponse(message) => throw new IllegalStateException(message)
+    case other => throw new IllegalStateException(s"CAPABILITIES failed: $other")
+  }
+
+  private final class ControlPool(host: String, remotePort: Int) {
+    private val slots = new Semaphore(controlConnectionsPerPeer, true)
+    private val idle = new ConcurrentLinkedQueue[CachedControl]()
+    private val all = ConcurrentHashMap.newKeySet[CachedControl]()
+    def openCount: Int = all.size()
+    private def discard(connection: CachedControl): Unit = {
+      all.remove(connection)
+      try connection.socket.close() catch { case NonFatal(_) => () }
+    }
+    def use[T](body: (ControlChannel, PeerIdentity) => T): T = {
+      requireReady()
+      val acquired = try slots.tryAcquire(timeoutMs.toLong, TimeUnit.MILLISECONDS) catch {
+        case e: InterruptedException =>
+          Thread.currentThread().interrupt()
+          throw new IllegalStateException("UB control pool wait interrupted", e)
+      }
+      if (!acquired)
+        throw new java.net.SocketTimeoutException("UB control connection pool wait timed out")
+      var connection: CachedControl = null
+      var reusable = false
+      try {
+        requireReady()
+        connection = idle.poll()
+        if (connection != null) {
+          // Only the side-effect-free liveness probe may reconnect. Never replay a
+          // block operation whose ACQUIRE/COMMIT/RELEASE outcome is ambiguous.
+          try {
+            checkControl(connection.channel)
+            controlConnectionReuses.incrementAndGet()
+          } catch {
+            case _: IOException => discard(connection); connection = null
+          }
+        }
+        if (connection == null) {
+          connection = openControl(host, remotePort)
+          all.add(connection)
+        }
+        requireReady()
+        val result = body(connection.channel, connection.peer)
+        connection.uses += 1
+        reusable = true
+        result
+      } finally {
+        if (connection != null) {
+          // Rotate periodically so the existing per-channel request-id history is
+          // bounded without weakening duplicate/correlation validation.
+          if (reusable && !closed && connection.uses < 4096) idle.offer(connection)
+          else discard(connection)
+        }
+        slots.release()
+      }
+    }
+    def close(): Unit = {
+      val connections = all.iterator()
+      while (connections.hasNext) discard(connections.next())
+      idle.clear()
+    }
+  }
+
+  private def withControl[T](host: String, remotePort: Int)(body: (ControlChannel, PeerIdentity) => T): T = {
+    requireReady()
+    val pool = controlPools.synchronized {
+      controlPools.getOrElseUpdate((host, remotePort), new ControlPool(host, remotePort))
+    }
+    pool.use(body)
+  }
+
+  private def closeControlSockets(): Unit = {
+    controlPools.synchronized { controlPools.values.foreach(_.close()) }
+    val inbound = inboundControlSockets.iterator()
+    while (inbound.hasNext) {
+      try inbound.next().close() catch { case NonFatal(_) => () }
+    }
   }
 
   private def ensureConnected(remoteBytes: Array[Byte]): Unit = connectLock.synchronized {
@@ -1060,6 +1156,9 @@ private[scache] class UBBlockTransferService(
       }
       if (arena != null) arena.close(unpublishTimeoutMs)
       if (transport != null) transport.close()
+      // Close idle handlers only after registered memory and all leases drained.
+      // Closing a live lease's socket earlier would quarantine its source arena.
+      closeControlSockets()
       closeCompleted = true
       UBBlockTransferService.quarantinedServices.remove(this)
     } catch {
@@ -1100,6 +1199,11 @@ private[scache] class UBBlockTransferService(
       "urma.nodeEpoch" -> epoch,
       "urma.lastNativeAggregateRequestId" -> lastNativeRequestId.get(),
       "urma.activeControlConnections" -> activeControlConnections.get(),
+      "urma.controlConnectionsCreated" -> controlConnectionsCreated.get(),
+      "urma.controlConnectionReuses" -> controlConnectionReuses.get(),
+      "urma.pooledControlConnections" -> controlPools.synchronized {
+        controlPools.valuesIterator.map(_.openCount.toLong).sum
+      },
       "urma.arenaFreeBytes" -> (if (arena == null) 0L else arena.freeBytes),
       "urma.arenaPublishedBlocks" -> (if (arena == null) 0L else arena.publishedBlocks),
       "urma.activeLeases" -> (if (arena == null) 0L else arena.activeLeases),

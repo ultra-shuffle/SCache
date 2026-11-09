@@ -132,6 +132,7 @@ object RmCtpServiceProtocolTest {
     require(addressService.hostName == "192.0.2.10",
       "BlockManager must publish the configured UB control advertise host")
     addressService.close()
+    controlConnectionReuse()
     rejectedControlHandoffClosesSocket()
     allocationFailureReleasesSource()
     Seq("submit", "completion", "checksum").foreach(failedReadCanRetry)
@@ -244,6 +245,41 @@ object RmCtpServiceProtocolTest {
       source.unpublishBlock(block)
       println("UB_MIDDLE_WINDOW_FAILURE_RELEASE_PASS")
     } finally { try source.close() finally dest.close() }
+  }
+
+  private def controlConnectionReuse(): Unit = {
+    val source = start("control-pool-source")
+    val dest = start("control-pool-dest")
+    val block = ScacheBlockId("connection-reuse", 1, 1, 0, 0)
+    try {
+      source.publishBlock(block, Array.tabulate[Byte](64)(_.toByte))
+      for (_ <- 0 until 10000)
+        dest.probeRemoteDescriptor("127.0.0.1", source.port, block.toString)
+      require(dest.urmaMetrics("urma.controlConnectionsCreated") <= 3,
+        "one TCP connection was opened per block instead of reused")
+      require(dest.urmaMetrics("urma.controlConnectionReuses") >= 9997)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+      // Simulate a peer closing an idle connection. Reconnect only for CAPABILITIES,
+      // before the next block operation has started.
+      val inbound = field(source, "inboundControlSockets").get(source)
+        .asInstanceOf[java.util.Set[Socket]].iterator()
+      while (inbound.hasNext) inbound.next().close()
+      dest.probeRemoteDescriptor("127.0.0.1", source.port, block.toString)
+      require(dest.urmaMetrics("urma.controlConnectionsCreated") <= 4)
+      val callers = java.util.concurrent.Executors.newFixedThreadPool(8)
+      try {
+        val futures = (0 until 8).map { _ => callers.submit(new Runnable {
+          override def run(): Unit = for (_ <- 0 until 100)
+            dest.probeRemoteDescriptor("127.0.0.1", source.port, block.toString)
+        }) }
+        futures.foreach(_.get(30, TimeUnit.SECONDS))
+      } finally callers.shutdownNow()
+      require(dest.urmaMetrics("urma.pooledControlConnections") <= 4)
+      require(source.urmaMetrics("urma.activeControlConnections") <= 4)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+      println("CONTROL_POOL_REUSE_PASS probes=10801 max_open_per_peer=4 idle_reconnect=true")
+    } finally { try source.close() finally dest.close() }
+    require(memory.isEmpty, "control pooling retained a test registration after close")
   }
 
   private def rejectedControlHandoffClosesSocket(): Unit = {
