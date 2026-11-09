@@ -93,6 +93,10 @@ class ScacheClient(
   private lazy val ubPoolFetchParallelism =
     math.max(1, conf.getInt("scache.ub.pool.fetchParallelism", 4))
   private lazy val ubPoolFetchSlots = new Semaphore(ubPoolFetchParallelism)
+  // Queue pending fetches before they occupy an OS thread. A cached execution context plus
+  // acquire() inside each Future creates one parked thread per block, not per active READ.
+  private lazy val ubPoolFetchExecutionContext =
+    ScacheClient.newUbPoolFetchExecutionContext(ubPoolFetchParallelism)
   private lazy val ubPoolFetches =
     new ConcurrentHashMap[String, Future[Option[IpcBlock]]]()
 
@@ -298,6 +302,7 @@ class ScacheClient(
 
 
   override def onStop(): Unit = {
+    if (ubSharedPoolEnabled) ubPoolFetchExecutionContext.shutdown()
     asyncThreadPool.shutdown()
   }
 
@@ -1003,7 +1008,7 @@ class ScacheClient(
             ScacheClient.acquireUbPoolSlot(ubPoolFetchSlots)
             try getBlockIpcFromDaemon(context, blockId)
             finally ubPoolFetchSlots.release()
-          }.onComplete { result =>
+          }(ubPoolFetchExecutionContext).onComplete { result =>
             ScacheClient.finishUbPoolFetch(ubPoolFetches, key, promise, result)
           }
           promise.future
@@ -1037,6 +1042,13 @@ class ScacheClient(
 }
 
 object ScacheClient extends Logging{
+  private[deploy] def newUbPoolFetchExecutionContext(
+      parallelism: Int): ExecutionContextExecutorService = {
+    require(parallelism > 0, "UB pool fetch parallelism must be positive")
+    ExecutionContext.fromExecutorService(
+      ThreadUtils.newDaemonFixedThreadPool(parallelism, "ub-pool-fetch-worker"))
+  }
+
   /** Remove a completed single-flight entry before exposing its slice to any caller. Otherwise
     * an immediately released final consumer can unpublish it while a new caller joins the stale
     * completed Future and receives an already-recycled pool address.
