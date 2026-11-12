@@ -511,19 +511,21 @@ class Daemon(
     val received = new java.util.BitSet(blockIds.size)
     val endpoint = new ThreadSafeRpcEndpoint {
       override val rpcEnv: RpcEnv = Daemon.this.rpcEnv
+      private var remaining = blockIds.size
       override def receive: PartialFunction[Any, Unit] = {
         case IpcBlockReady(index, result, error) =>
           if (index < 0 || index >= blockIds.size) {
             done.tryFailure(new IllegalStateException("Invalid IPC completion index " + index))
           } else if (!received.get(index)) {
             received.set(index)
+            remaining -= 1
             val outcome = error match {
               case Some(message) => Failure(new IllegalStateException(message))
               case None => Success(result)
             }
             try callback.accept(Integer.valueOf(index), outcome)
             catch { case NonFatal(e) => done.tryFailure(e) }
-            if (received.cardinality() == blockIds.size) {
+            if (remaining == 0) {
               done.trySuccess(())
               stop()
             }
