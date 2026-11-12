@@ -46,6 +46,11 @@ private[deploy] object DeployMessages {
   case class GetBlock(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlockIpc(scacheBlockId: BlockId) extends FromDaemon
   case class GetBlocksIpc(scacheBlockIds: Seq[BlockId]) extends FromDaemon
+  // One batch request, independent completion notifications. Never replay a reservation.
+  case class GetBlocksIpcStream(scacheBlockIds: Seq[BlockId], replyTo: RpcEndpointRef)
+    extends FromDaemon
+  case class IpcBlockReady(index: Int, result: Option[IpcBlock], error: Option[String])
+    extends Serializable
   // Reducer-side pool slices are transient destinations. Spark sends this after the
   // corresponding ManagedBuffer has been consumed so the arena can be reused immediately.
   case class ReleaseImportedBlock(scacheBlockId: BlockId) extends FromDaemon

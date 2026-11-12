@@ -16,7 +16,7 @@ import org.scache.util._
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future, Promise}
 import scala.reflect.ClassTag
 import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
@@ -35,7 +35,7 @@ case class DaemonEndpointConfig(
 
 private[deploy] object DaemonRpcReplayPolicy {
   private val statefulPoolOperations = Set(
-    "get-ipc", "get-ipc-batch", "release-imported-block", "prepare-put-pool",
+    "get-ipc", "get-ipc-batch", "get-ipc-stream", "release-imported-block", "prepare-put-pool",
     "prepare-put", "prepare-put-batch", "commit-put-pool", "commit-put",
     "commit-put-batch", "abort-put-pool")
 
@@ -496,6 +496,45 @@ class Daemon(
     val scacheBlockIds = blockIds.map(BlockId.apply).filter(_.isInstanceOf[ScacheBlockId])
     if (scacheBlockIds.isEmpty) return Seq.empty
     askClient[Seq[Option[IpcBlock]]]("get-ipc-batch", GetBlocksIpc(scacheBlockIds))
+  }
+
+  /** Results cross the local class-loader boundary through a JDK callback, one per block.
+    * This coordinator waits for completion, but each callback is visible to Spark immediately.
+    */
+  def getBlocksIpcStreaming(
+      blockIds: Seq[String],
+      callback: java.util.function.BiConsumer[java.lang.Integer, AnyRef]): Unit = {
+    if (blockIds.isEmpty) return
+    val parsed = blockIds.map(BlockId.apply)
+    require(parsed.forall(_.isInstanceOf[ScacheBlockId]), "Invalid streaming shuffle block")
+    val done = Promise[Unit]()
+    val received = new java.util.BitSet(blockIds.size)
+    val endpoint = new ThreadSafeRpcEndpoint {
+      override val rpcEnv: RpcEnv = Daemon.this.rpcEnv
+      override def receive: PartialFunction[Any, Unit] = {
+        case IpcBlockReady(index, result, error) =>
+          if (index < 0 || index >= blockIds.size) {
+            done.tryFailure(new IllegalStateException("Invalid IPC completion index " + index))
+          } else if (!received.get(index)) {
+            received.set(index)
+            val outcome = error match {
+              case Some(message) => Failure(new IllegalStateException(message))
+              case None => Success(result)
+            }
+            try callback.accept(Integer.valueOf(index), outcome)
+            catch { case NonFatal(e) => done.tryFailure(e) }
+            if (received.cardinality() == blockIds.size) {
+              done.trySuccess(())
+              stop()
+            }
+          }
+      }
+    }
+    val ref = rpcEnv.setupEndpoint("ub-ipc-stream-" + requestSequence.incrementAndGet(), endpoint)
+    // No retry: a timed-out submission may already own destination reservations.
+    // Keep its endpoint alive after timeout so late completions can still be released by Spark.
+    askClient[Boolean]("get-ipc-stream", GetBlocksIpcStream(parsed, ref))
+    RpcUtils.askRpcTimeout(conf).awaitResult(done.future)
   }
 
   /**

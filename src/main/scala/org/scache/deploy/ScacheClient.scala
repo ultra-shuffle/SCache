@@ -404,6 +404,22 @@ class ScacheClient(
           getBlockIpcFromDaemon(context, blockId)
         }
       }
+    case GetBlocksIpcStream(blockIds, replyTo) =>
+      if (!ubSharedPoolEnabled) {
+        context.sendFailure(new IllegalStateException("Streaming IPC requires the UB pool"))
+      } else {
+        // Reserving a long batch must not hold the RPC endpoint while releases/heartbeats wait.
+        doAsync[Boolean](s"Start streaming IPC batch of ${blockIds.size} blocks", context) {
+          ScacheClient.streamUbPoolBatch(blockIds,
+            blockId => ubPoolFetchSingleFlight(context, blockId),
+            (index, outcome) => outcome match {
+              case Success(result) => replyTo.send(IpcBlockReady(index, result, None))
+              case Failure(error) => replyTo.send(IpcBlockReady(index, None,
+                Some(error.getClass.getName + ": " + Option(error.getMessage).getOrElse(""))))
+            })
+          true
+        }
+      }
     case GetBlocksIpc(blockIds) =>
       doAsync[Seq[Option[IpcBlock]]](s"Fetch IPC locations for ${blockIds.size} blocks from daemon", context) {
         if (ubSharedPoolEnabled) {
@@ -1042,6 +1058,25 @@ class ScacheClient(
 }
 
 object ScacheClient extends Logging{
+  /** Preserve batch submission; expose each settled child without Future.sequence/Await. */
+  private[deploy] def streamUbPoolBatch(
+      blockIds: Seq[BlockId],
+      fetch: BlockId => Future[Option[IpcBlock]],
+      deliver: (Int, Try[Option[IpcBlock]]) => Unit)(implicit ec: ExecutionContext): Unit = {
+    blockIds.zipWithIndex.foreach { case (blockId, index) =>
+      val started = try {
+        val result = fetch(blockId)
+        if (result == null) throw new IllegalStateException("UB pool fetch returned null")
+        result
+      } catch {
+        case e: InterruptedException =>
+          Future.failed(new IllegalStateException("Interrupted starting UB pool read", e))
+        case NonFatal(e) => Future.failed(e)
+      }
+      started.onComplete(outcome => deliver(index, outcome))
+    }
+  }
+
   private[deploy] def newUbPoolFetchExecutionContext(
       parallelism: Int): ExecutionContextExecutorService = {
     require(parallelism > 0, "UB pool fetch parallelism must be positive")
