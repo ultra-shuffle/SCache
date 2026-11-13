@@ -94,7 +94,8 @@ object RmCtpServiceProtocolTest {
   private def field(service: UBBlockTransferService, name: String): java.lang.reflect.Field = {
     val f = classOf[UBBlockTransferService].getDeclaredField(name); f.setAccessible(true); f
   }
-  private def start(label: String, strict: Boolean = false, window: Int = 1048576): UBBlockTransferService = {
+  private def start(label: String, strict: Boolean = false, window: Int = 1048576,
+      arenaCapacity: Int = 1048576): UBBlockTransferService = {
     val home = Files.createTempDirectory("scache-service-contract-")
     Files.createDirectory(home.resolve("conf")); Files.createDirectory(home.resolve("pool"))
     Files.writeString(home.resolve("conf/log4j.properties"), "log4j.rootLogger=OFF\n")
@@ -108,7 +109,7 @@ object RmCtpServiceProtocolTest {
     conf.set("scache.ub.readWindowBytes", window.toString)
     val s = new UBBlockTransferService(conf, "127.0.0.1", 1)
     val t = new CopyTransport
-    val pool = new UBBlockTransferService.RegisteredArenaPool(t, 1048576, 3, label,
+    val pool = new UBBlockTransferService.RegisteredArenaPool(t, arenaCapacity, 3, label,
       field(s, "epoch").getLong(s), 30000, Some(home.resolve("pool").toString))
     val socket = new ServerSocket(0, 64, InetAddress.getLoopbackAddress)
     field(s, "transport").set(s, t); field(s, "arena").set(s, pool)
@@ -133,6 +134,12 @@ object RmCtpServiceProtocolTest {
       "BlockManager must publish the configured UB control advertise host")
     addressService.close()
     controlConnectionReuse()
+    batchContiguousReads()
+    batchFailureAndMissing()
+    batchDoesNotCrossMr()
+    batchNeverReadsAcrossGaps()
+    batchConsumerReferences()
+    batchAllocationRollsBack()
     rejectedControlHandoffClosesSocket()
     allocationFailureReleasesSource()
     Seq("submit", "completion", "checksum").foreach(failedReadCanRetry)
@@ -224,6 +231,165 @@ object RmCtpServiceProtocolTest {
       require(dest.urmaMetrics("urma.peakScratchReadBytes") == (if (window == 0) 4097 else 1024))
       println(s"UB_ORDINARY_WINDOW_READ_PASS window=$window cases=6")
     } finally { try source.close() finally dest.close() }
+  }
+
+  private def batchContiguousReads(): Unit = {
+    for (reverse <- Seq(false, true)) {
+      val source = start("batch-source-" + reverse)
+      val dest = start("batch-dest-" + reverse)
+      val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+      val ids = (0 until 3).map(i => ScacheBlockId("batch", 1, 1, 0, i))
+      val sizes = Seq(7, 9, 11)
+      try {
+        ids.zip(sizes).foreach { case (id, n) => source.publishBlock(id, Array.fill[Byte](n)(n.toByte)) }
+        val order = if (reverse) ids.reverse else ids
+        order.foreach(dest.reservePoolConsumer)
+        val result = dest.fetchBlocksToPool("127.0.0.1", source.port, order.map(_.toString))
+        require(copy.readRanges.size == (if (reverse) 3 else 1),
+          "Only physically adjacent source/destination windows may coalesce")
+        result.zip(order).foreach { case (Some(slice), id) =>
+          val f = FileChannel.open(java.nio.file.Paths.get(slice.path), StandardOpenOption.READ)
+          try {
+            val b = ByteBuffer.allocate(slice.length)
+            while (b.hasRemaining) require(f.read(b, slice.offset + b.position()) > 0)
+            require(b.array().forall(_ == sizes(id.reduceId).toByte))
+          } finally f.close()
+          require(dest.releaseImportedPoolBlock(id))
+        case _ => sys.error("missing batch result") }
+        require(source.urmaMetrics("urma.activeLeases") == 0)
+        require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+        ids.foreach(source.unpublishBlock)
+      } finally { try source.close() finally dest.close() }
+    }
+    println("BATCH_CONTIGUOUS_ONE_READ_AND_NONCONTIGUOUS_SPLIT_PASS")
+  }
+
+  private def batchFailureAndMissing(): Unit = {
+    for (failure <- Seq("checksum", "submit", "missing")) {
+      val source = start("batch-fault-source-" + failure)
+      val dest = start("batch-fault-dest-" + failure)
+      val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+      val ids = (0 until 2).map(i => ScacheBlockId("batch-fault", 1, 1, 0, i))
+      try {
+        source.publishBlock(ids.head, Array.fill[Byte](7)(17))
+        if (failure != "missing") source.publishBlock(ids.last, Array.fill[Byte](9)(19))
+        ids.foreach(dest.reservePoolConsumer)
+        copy.corruptNextRead = failure == "checksum"
+        copy.rejectNextRead = failure == "submit"
+        var failed = false
+        try {
+          val values = dest.fetchBlocksToPool("127.0.0.1", source.port, ids.map(_.toString))
+          require(failure == "missing" && values.head.nonEmpty && values.last.isEmpty)
+          require(dest.releaseImportedPoolBlock(ids.head)); dest.cancelPoolConsumer(ids.last)
+        } catch { case _: IllegalStateException =>
+          failed = true; ids.foreach(dest.cancelPoolConsumer)
+        }
+        require(failed == (failure != "missing"))
+        require(source.urmaMetrics("urma.activeLeases") == 0)
+        require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+        require(dest.urmaMetrics("urma.arenaPublishedBlocks") == 0)
+        ids.foreach(source.unpublishBlock)
+      } finally { try source.close() finally dest.close() }
+    }
+    require(memory.isEmpty)
+    println("BATCH_CRC_SUBMIT_FAILURE_AND_MISSING_CLEANUP_PASS")
+  }
+
+  private def batchDoesNotCrossMr(): Unit = {
+    val source = start("batch-mr-source", arenaCapacity = 32)
+    val dest = start("batch-mr-dest", arenaCapacity = 32)
+    val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+    val ids = (0 until 2).map(i => ScacheBlockId("batch-mr", 1, 1, 0, i))
+    try {
+      source.publishBlock(ids.head, Array.fill[Byte](17)(1))
+      source.publishBlock(ids.last, Array.fill[Byte](19)(2))
+      ids.foreach(dest.reservePoolConsumer)
+      val values = dest.fetchBlocksToPool("127.0.0.1", source.port, ids.map(_.toString))
+      require(values.forall(_.isDefined) && copy.readRanges.size == 2)
+      ids.foreach(dest.releaseImportedPoolBlock)
+      ids.foreach(source.unpublishBlock)
+      require(dest.urmaMetrics("urma.arenaFreeBytes") == 96)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+    } finally { try source.close() finally dest.close() }
+    println("BATCH_READ_NEVER_CROSSES_REGISTERED_MR_PASS")
+  }
+
+  private def batchNeverReadsAcrossGaps(): Unit = {
+    for (destinationGap <- Seq(false, true)) {
+      val source = start("batch-gap-source-" + destinationGap)
+      val dest = start("batch-gap-dest-" + destinationGap)
+      val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+      val ids = (0 until 3).map(i => ScacheBlockId("batch-gap", 1, 1, 0, i))
+      val markers = (0 until 3).map(i => ScacheBlockId("destination-gap", 1, 1, 0, i))
+      try {
+        val requested = if (destinationGap) {
+          markers.zip(Seq(7, 9, 11)).foreach { case (id, n) => dest.publishBlock(id, Array.fill[Byte](n)(31)) }
+          dest.unpublishBlock(markers.head); dest.unpublishBlock(markers.last)
+          source.publishBlock(ids.head, Array.fill[Byte](7)(7))
+          source.publishBlock(ids.last, Array.fill[Byte](11)(11))
+          Seq(ids.head, ids.last)
+        } else {
+          ids.zip(Seq(7, 9, 11)).foreach { case (id, n) => source.publishBlock(id, Array.fill[Byte](n)(n.toByte)) }
+          Seq(ids.head, ids.last)
+        }
+        requested.foreach(dest.reservePoolConsumer)
+        val values = dest.fetchBlocksToPool("127.0.0.1", source.port, requested.map(_.toString))
+        require(values.forall(_.isDefined) && copy.readRanges.size == 2)
+        require(copy.readRanges.map(_._3).sum == 18, "must not read unrelated gap bytes")
+        requested.foreach(dest.releaseImportedPoolBlock)
+        ids.foreach(source.unpublishBlock)
+        markers.foreach(dest.unpublishBlock)
+        require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+        require(source.urmaMetrics("urma.activeLeases") == 0)
+      } finally { try source.close() finally dest.close() }
+    }
+    println("BATCH_SOURCE_AND_DESTINATION_GAPS_SPLIT_WITHOUT_EXTRA_BYTES_PASS")
+  }
+
+  private def batchConsumerReferences(): Unit = {
+    val source = start("batch-consumers-source")
+    val dest = start("batch-consumers-dest")
+    val ids = (0 until 2).map(i => ScacheBlockId("batch-consumers", 1, 1, 0, i))
+    try {
+      ids.foreach(id => source.publishBlock(id, Array.fill[Byte](7)(id.reduceId.toByte)))
+      ids.foreach { id => dest.reservePoolConsumer(id); dest.reservePoolConsumer(id) }
+      require(dest.fetchBlocksToPool("127.0.0.1", source.port, ids.map(_.toString)).forall(_.isDefined))
+      var rejected = false
+      try dest.releaseImportedPoolBlocks(Seq(ids.head, ids.head))
+      catch { case _: IllegalArgumentException => rejected = true }
+      require(rejected, "duplicate batch IDs must not double-decrement a consumer")
+      require(dest.releaseImportedPoolBlocks(ids))
+      require(ids.forall(dest.localPoolBlock(_).nonEmpty), "first consumer must not reclaim the shared slice")
+      require(dest.releaseImportedPoolBlocks(ids))
+      require(ids.forall(dest.localPoolBlock(_).isEmpty))
+      require(!dest.releaseImportedPoolBlocks(ids), "a third release must not succeed")
+      require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+      ids.foreach(source.unpublishBlock)
+    } finally { try source.close() finally dest.close() }
+    println("BATCH_RELEASE_MULTIPLE_CONSUMERS_AND_DUPLICATE_GUARD_PASS")
+  }
+
+  private def batchAllocationRollsBack(): Unit = {
+    val source = start("batch-allocation-source")
+    val dest = start("batch-allocation-dest", arenaCapacity = 8)
+    val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+    val ids = (0 until 2).map(i => ScacheBlockId("batch-allocation", 1, 1, 0, i))
+    try {
+      source.publishBlock(ids.head, Array.fill[Byte](7)(7))
+      source.publishBlock(ids.last, Array.fill[Byte](9)(9))
+      ids.foreach(dest.reservePoolConsumer)
+      var failed = false
+      try dest.fetchBlocksToPool("127.0.0.1", source.port, ids.map(_.toString))
+      catch { case _: IllegalStateException => failed = true }
+      require(failed && copy.readRanges.isEmpty)
+      ids.foreach(dest.cancelPoolConsumer)
+      require(dest.urmaMetrics("urma.arenaFreeBytes") == 24)
+      require(source.urmaMetrics("urma.activeLeases") == 0)
+      require(ids.forall(dest.localPoolBlock(_).isEmpty))
+      ids.foreach(source.unpublishBlock)
+    } finally { try source.close() finally dest.close() }
+    println("BATCH_PARTIAL_ALLOCATION_ROLLBACK_BEFORE_READ_PASS")
   }
 
   private def failedMiddleWindowReleasesResources(): Unit = {

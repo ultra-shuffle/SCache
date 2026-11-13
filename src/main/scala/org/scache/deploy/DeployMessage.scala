@@ -54,6 +54,7 @@ private[deploy] object DeployMessages {
   // Reducer-side pool slices are transient destinations. Spark sends this after the
   // corresponding ManagedBuffer has been consumed so the arena can be reused immediately.
   case class ReleaseImportedBlock(scacheBlockId: BlockId) extends FromDaemon
+  case class ReleaseImportedBlocks(scacheBlockIds: Seq[BlockId]) extends FromDaemon
   case class RegisterShuffle(appName: String, jobId: Int, ids: Array[Int], numMaps: Array[Int], numReduces: Array[Int]) extends FromDaemon
   // A shuffle id is only unique within a Spark application lifetime.  Include
   // the Spark job id so job-end cleanup cannot remove a later job's blocks that

@@ -100,6 +100,12 @@ private[scache] class UBBlockTransferService(
   private val sharedPoolAborts = new AtomicLong(0L)
   private val sharedPoolImports = new AtomicLong(0L)
   private val sharedPoolDestinationReads = new AtomicLong(0L)
+  private val batchControlRequests = new AtomicLong(0L)
+  private val batchConsumerReleases = new AtomicLong(0L)
+  private val batchReadOperations = new AtomicLong(0L)
+  private val batchReadBlocks = new AtomicLong(0L)
+  private val readBatchBytes = math.max(1L,
+    conf.getSizeAsBytes("scache.ub.pool.batchReadBytes", "4m"))
   private val sharedPoolDestinationBytes = new AtomicLong(0L)
   private val sharedPoolDestinationIdentityMatches = new AtomicLong(0L)
   private val sharedPoolDestinationIdentityMismatches = new AtomicLong(0L)
@@ -397,6 +403,109 @@ private[scache] class UBBlockTransferService(
     }
   }
 
+  /** Paired-version batch control. Payload stays in registered arenas; no staging copy.
+    * The caller holds one single-flight claim and consumer reservation per block.
+    * Each child remains independently checksummed and published after its READ completes.
+    */
+  private[scache] def fetchBlocksToPool(
+      host: String, remotePort: Int, blockIds: Seq[String]): Seq[Option[PoolSlice]] = {
+    requireReady()
+    require(blockIds.nonEmpty && blockIds.size <= MaxBatchBlocks &&
+      blockIds.distinct.size == blockIds.size, "invalid UB control batch")
+    require(sharedPoolEnabled, "UB batch requires shared pool")
+    blockIds.foreach(id => importedSharedBlocks.synchronized { rejectRetiredPoolBlock(id) })
+    withControl(host, remotePort) { (channel, peer) =>
+      val grants = channel.exchange(AcquireBatch(blockIds)) match {
+        case Grants(values) if values.size == blockIds.size => values
+        case other => throw new IllegalStateException(s"UB batch ACQUIRE failed: $other")
+      }
+      val prepared = mutable.ArrayBuffer.empty[(Descriptor, PoolSlice)]
+      var released = false
+      try {
+        grants.zip(blockIds).foreach { case (value, id) => value.foreach { d =>
+          validateDescriptor(d, peer, id)
+        }}
+        val present = grants.flatten
+        // Reserve this bounded batch under one allocator lock. Otherwise the four
+        // workers can interleave A1/B1/A2/B2 destinations and destroy adjacency
+        // even when all source windows are contiguous.
+        val destinations = arena.prepareSharedBatch(
+          present.map(d => d.blockId -> d.length), ownerPeer = "remote-fetch")
+        prepared ++= present.zip(destinations)
+        // Only merge actual adjacent windows in the same source and destination MR.
+        // Logical reduce-id adjacency alone is insufficient after allocator reuse.
+        val groups = mutable.ArrayBuffer.empty[mutable.ArrayBuffer[(Descriptor, PoolSlice)]]
+        prepared.foreach { item =>
+          val join = groups.lastOption.exists { group =>
+            val (prev, dest) = group.last
+            val (next, nextDest) = item
+            prev.segment == next.segment && prev.arenaId == next.arenaId &&
+              prev.baseAddress == next.baseAddress && prev.token == next.token &&
+              prev.segmentGeneration == next.segmentGeneration &&
+              prev.offset.toLong + prev.length == next.offset.toLong &&
+              dest.path == nextDest.path && dest.offset + dest.length == nextDest.offset &&
+              group.iterator.map(_._1.length.toLong).sum + next.length <= readBatchBytes
+          }
+          if (join) groups.last += item else groups += mutable.ArrayBuffer(item)
+        }
+        groups.foreach { group =>
+          val (head, _) = group.head
+          val length = Math.toIntExact(group.iterator.map(_._1.length.toLong).sum)
+          val ids = group.map(_._1.blockId).toVector
+          val buffer = arena.sharedRangeBuffer(ids)
+          val combined = head.copy(length = length)
+          transferRead(combined, buffer, s"pool-batch-${head.blockId}", head.blockId)
+          batchReadOperations.incrementAndGet()
+          batchReadBlocks.addAndGet(group.size.toLong)
+        }
+        val checksums = prepared.map { case (d, _) =>
+          val value = if (sharedPoolChecksumEnabled) crc(arena.sharedBuffer(d.blockId), d.length) else -1L
+          if (sharedPoolChecksumEnabled && value != d.crc) {
+            checksumErrors.incrementAndGet()
+            throw new IllegalStateException(s"CRC mismatch for UB batch block=${d.blockId}")
+          }
+          value
+        }
+        channel.exchange(ReleaseBatch(grants.flatten.map(d => (d.leaseId, d.generation)))) match {
+          case Ack => released = true
+          case other => throw new IllegalStateException(s"UB batch RELEASE failed: $other")
+        }
+        prepared.zip(checksums).foreach { case ((d, slice), actual) =>
+          importedSharedBlocks.synchronized {
+            rejectRetiredPoolBlock(d.blockId)
+            require(arena.commitShared(d.blockId, slice.path, slice.offset, slice.length,
+              ownerPeer = "remote-fetch", expectedCrc = actual), "UB batch publish failed")
+            importedSharedBlocks += d.blockId
+          }
+          sharedPoolImports.incrementAndGet()
+          sharedPoolDestinationReads.incrementAndGet()
+          sharedPoolDestinationBytes.addAndGet(d.length.toLong)
+          sharedPoolDestinationIdentityMatches.incrementAndGet()
+        }
+        batchControlRequests.incrementAndGet()
+        val byId = prepared.map { case (d, slice) => d.blockId -> slice }.toMap
+        blockIds.map(byId.get)
+      } catch {
+        case NonFatal(e) =>
+          if (!dmaUnresolved) {
+            prepared.foreach { case (d, slice) =>
+              try {
+                importedSharedBlocks.synchronized {
+                  if (importedSharedBlocks.remove(d.blockId)) arena.unpublish(d.blockId, timeoutMs)
+                  else arena.abortShared(d.blockId, slice.path, slice.offset, slice.length,
+                    ownerPeer = "remote-fetch")
+                }
+              } catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+            }
+            if (!released) try {
+              channel.exchange(ReleaseBatch(grants.flatten.map(d => (d.leaseId, d.generation))))
+            } catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+          }
+          throw e
+      }
+    }
+  }
+
   /** Reserve one eventual Spark consumer before entering the single-flight fetch. */
   private[scache] def reservePoolConsumer(blockId: BlockId): Unit = {
     require(blockId != null, "UB pool consumer blockId must not be null")
@@ -483,6 +592,20 @@ private[scache] class UBBlockTransferService(
       }
     }
     true
+  }
+
+  private[scache] def releaseImportedPoolBlocks(blockIds: Seq[BlockId]): Boolean = {
+    require(blockIds.size <= 256 && blockIds.distinct.size == blockIds.size,
+      "invalid imported release batch")
+    var accepted = true
+    var failure: Throwable = null
+    blockIds.foreach { id =>
+      try { if (!releaseImportedPoolBlock(id)) accepted = false }
+      catch { case NonFatal(e) => if (failure == null) failure = e else failure.addSuppressed(e) }
+    }
+    batchConsumerReleases.incrementAndGet()
+    if (failure != null) throw failure
+    accepted
   }
 
   /**
@@ -956,6 +1079,35 @@ private[scache] class UBBlockTransferService(
       var keepServing = true
       while (keepServing) channel.receiveRequest() match {
         case Capabilities => channel.sendResponse(Capabilities)
+        case AcquireBatch(ids) =>
+          val acquired = mutable.ArrayBuffer.empty[Descriptor]
+          val values = try {
+            ids.map { id =>
+              val value = arena.acquire(id, ownerKey)
+              value.foreach(acquired += _)
+              value
+            }
+          } catch {
+            case NonFatal(e) =>
+              acquired.foreach(d => arena.release(d.leaseId, d.generation, ownerKey))
+              throw e
+          }
+          // Once response transmission starts, failure is ambiguous: the client may
+          // already have received a complete GRANT. Keep releaseOwner's quarantine
+          // behavior instead of returning these source slices prematurely.
+          channel.sendResponse(Grants(values))
+        case ReleaseBatch(values) =>
+          val failures = values.flatMap { case (lease, generation) =>
+            arena.release(lease, generation, ownerKey) match {
+              case Released | AlreadyReleased => None
+              case LeaseRejected(message) => Some(message)
+            }
+          }
+          if (failures.isEmpty) channel.sendResponse(Ack)
+          else {
+            leaseErrors.addAndGet(failures.size.toLong)
+            channel.sendResponse(ErrorResponse(failures.mkString("; ")))
+          }
         case Acquire(blockId) =>
           arena.acquire(blockId, ownerKey) match {
             case Some(d) =>
@@ -1187,6 +1339,10 @@ private[scache] class UBBlockTransferService(
       "urma.sharedPoolAborts" -> sharedPoolAborts.get(),
       "urma.sharedPoolImports" -> sharedPoolImports.get(),
       "urma.sharedPoolDestinationReads" -> sharedPoolDestinationReads.get(),
+      "urma.batchControlRequests" -> batchControlRequests.get(),
+      "urma.batchConsumerReleases" -> batchConsumerReleases.get(),
+      "urma.batchReadOperations" -> batchReadOperations.get(),
+      "urma.batchReadBlocks" -> batchReadBlocks.get(),
       "urma.sharedPoolDestinationBytes" -> sharedPoolDestinationBytes.get(),
       "urma.sharedPoolDestinationIdentityMatches" -> sharedPoolDestinationIdentityMatches.get(),
       "urma.sharedPoolDestinationIdentityMismatches" -> sharedPoolDestinationIdentityMismatches.get(),
@@ -1279,7 +1435,10 @@ private[ub] object UBBlockTransferService {
     .newKeySet[UBBlockTransferService]()
   private val ControlProtocolVersion = 3
   private val ControlHeaderBytes = 17L // opcode + protocol version + request/correlation id + length
-  private val MaxControlFrame = 64 * 1024
+  // Sixteen descriptors may each carry a 32 KiB provider context. Still bounded,
+  // and independently validated by the frame parser before allocating its body.
+  private val MaxControlFrame = 1024 * 1024
+  private val MaxBatchBlocks = 16
   private[ub] def validateControlHeader(
       version: Int,
       requestId: Long,
@@ -1322,6 +1481,15 @@ private[ub] object UBBlockTransferService {
   private final case class Abort(lease: String, generation: Long) extends Message { val kind = 10 }
   private case object Stale extends Message { val kind = 11 }
   private case object Capabilities extends Message { val kind = 12 }
+  private final case class AcquireBatch(ids: Seq[String]) extends Message { val kind = 13 }
+  private final case class Grants(values: Seq[Option[Descriptor]]) extends Message { val kind = 14 }
+  private final case class ReleaseBatch(values: Seq[(String, Long)]) extends Message { val kind = 15 }
+
+  private def batchCount(in: DataInputStream): Int = {
+    val n = in.readInt()
+    require(n >= 0 && n <= MaxBatchBlocks, "invalid UB control batch count")
+    n
+  }
 
   private[ub] final case class Descriptor(protocolVersion: Int, nodeId: String, epoch: Long, arenaId: String,
       baseAddress: Long, offset: Int, remoteAddress: Long, length: Int, token: Int,
@@ -1373,6 +1541,17 @@ private[ub] object UBBlockTransferService {
     message match {
       case Hello(node, epoch, endpoint) => putString(out, node); out.writeLong(epoch); out.writeInt(endpoint.length); out.write(endpoint)
       case Acquire(id) => putString(out, id)
+      case AcquireBatch(ids) =>
+        require(ids.nonEmpty && ids.size <= MaxBatchBlocks && ids.distinct.size == ids.size)
+        out.writeInt(ids.size); ids.foreach(putString(out, _))
+      case Grants(values) =>
+        require(values.size <= MaxBatchBlocks)
+        out.writeInt(values.size)
+        values.foreach { value => out.writeBoolean(value.isDefined); value.foreach(putDescriptor(out, _)) }
+      case ReleaseBatch(values) =>
+        require(values.size <= MaxBatchBlocks)
+        out.writeInt(values.size)
+        values.foreach { case (lease, generation) => putString(out, lease); out.writeLong(generation) }
       case Grant(d) => putDescriptor(out, d)
       case Release(lease, generation) => putString(out, lease); out.writeLong(generation)
       case ErrorResponse(message) => putString(out, message)
@@ -1398,6 +1577,14 @@ private[ub] object UBBlockTransferService {
       case 10 => Abort(getString(in), in.readLong())
       case 11 => Stale
       case 12 => Capabilities
+      case 13 =>
+        val ids = Vector.fill(batchCount(in))(getString(in))
+        require(ids.nonEmpty && ids.distinct.size == ids.size, "invalid UB batch ids")
+        AcquireBatch(ids)
+      case 14 => Grants(Vector.fill(batchCount(in)) {
+        if (in.readBoolean()) Some(getDescriptor(in)) else None
+      })
+      case 15 => ReleaseBatch(Vector.fill(batchCount(in))((getString(in), in.readLong())))
       case _ => throw new IllegalArgumentException(s"unknown control message $kind")
     }
     if (in.available() != 0) throw new IllegalArgumentException("trailing control bytes")
@@ -1416,7 +1603,10 @@ private[ub] object UBBlockTransferService {
       "error" -> ErrorResponse("typed"),
       "prepare" -> Prepare(d.blockId, d.length, d.crc, 4, 1, "java.lang.Object"),
       "commit" -> Commit(d.leaseId, d.generation), "abort" -> Abort(d.leaseId, d.generation),
-      "stale" -> Stale)
+      "stale" -> Stale,
+      "acquire_batch" -> AcquireBatch(Seq(d.blockId, d.blockId + "-missing")),
+      "grants_batch" -> Grants(Seq(Some(d), None)),
+      "release_batch" -> ReleaseBatch(Seq((d.leaseId, d.generation))))
     val results = scala.collection.mutable.ArrayBuffer.empty[(String, Boolean)]
     messages.foreach { case (name, message) =>
       val raw = encode(message)
@@ -1431,6 +1621,17 @@ private[ub] object UBBlockTransferService {
       results += name -> ok
     }
     rejected("unknown_opcode") { decode(255, Array.emptyByteArray) }
+    rejected("empty_acquire_batch") { encode(AcquireBatch(Seq.empty)) }
+    rejected("duplicate_acquire_batch") { encode(AcquireBatch(Seq("duplicate", "duplicate"))) }
+    rejected("oversized_acquire_batch") { encode(AcquireBatch((0 to MaxBatchBlocks).map(_.toString))) }
+    val maxContext = new Array[Byte](SegmentDescriptor.MAX_PROVIDER_CONTEXT)
+    val full = d.copy(segment = new SegmentDescriptor(new Array[Byte](16), 17, 0,
+      0x1000L, 4096L, 3, 42L, maxContext))
+    val largeGrant = Grants(Vector.fill(MaxBatchBlocks)(Some(full)))
+    results += "batch_max_provider_context_frame" -> {
+      val raw = encode(largeGrant)
+      raw.length < MaxControlFrame && encode(decode(largeGrant.kind, raw)).sameElements(raw)
+    }
     rejected("trailing_bytes") { decode(Ack.kind, Array[Byte](1)) }
     rejected("protocol_version") { validateControlHeader(1, 1L, 0, Set.empty) }
     rejected("zero_request_id") { validateControlHeader(ControlProtocolVersion, 0L, 0, Set.empty) }
@@ -1590,6 +1791,27 @@ private[ub] object UBBlockTransferService {
         .getOrElse(throw exhaustion("shared prepare"))
       target.prepareShared(blockId, length, ownerPeer)
     }
+    def prepareSharedBatch(blocks: Seq[(String, Int)], ownerPeer: String): Seq[PoolSlice] = synchronized {
+      require(blocks.size <= MaxBatchBlocks && blocks.map(_._1).distinct.size == blocks.size,
+        "invalid destination allocation batch")
+      val allocated = mutable.ArrayBuffer.empty[(RegisteredArena, String, PoolSlice)]
+      try {
+        blocks.foreach { case (id, length) =>
+          require(!arenas.exists(_.containsBlock(id)), "destination batch must own a new single-flight block")
+          val target = arenas.find(_.canAllocate(length)).getOrElse(throw exhaustion("batch prepare"))
+          val slice = target.prepareShared(id, length, ownerPeer)
+          allocated += ((target, id, slice))
+        }
+        allocated.map(_._3).toVector
+      } catch {
+        case NonFatal(e) =>
+          allocated.foreach { case (owner, id, slice) =>
+            try owner.abortShared(id, slice.path, slice.offset, slice.length, ownerPeer)
+            catch { case NonFatal(cleanup) => e.addSuppressed(cleanup) }
+          }
+          throw e
+      }
+    }
     def commitShared(
         blockId: String,
         path: String,
@@ -1608,6 +1830,11 @@ private[ub] object UBBlockTransferService {
     def sharedBuffer(blockId: String): ByteBuffer =
       arenas.find(_.containsBlock(blockId)).map(_.sharedBuffer(blockId))
         .getOrElse(throw new IllegalStateException(s"unknown UB shared block $blockId"))
+    def sharedRangeBuffer(blockIds: Seq[String]): ByteBuffer = {
+      require(blockIds.nonEmpty, "empty shared range")
+      arenas.find(_.containsBlock(blockIds.head)).map(_.sharedRangeBuffer(blockIds))
+        .getOrElse(throw new IllegalStateException("unknown shared range head"))
+    }
     def unpublish(blockId: String, timeoutMs: Int): Unit =
       arenas.find(_.containsBlock(blockId)).foreach(_.unpublish(blockId, timeoutMs))
     def acquire(blockId: String, ownerPeer: String): Option[Descriptor] =
@@ -1772,6 +1999,20 @@ private[ub] object UBBlockTransferService {
         throw new IllegalStateException(s"UB shared block $blockId is not readable in state ${entry.state}")
       }
       view(entry.slice)
+    }
+
+    /** Validate every destination entry before exposing one larger registered view. */
+    def sharedRangeBuffer(blockIds: Seq[String]): ByteBuffer = synchronized {
+      require(blockIds.nonEmpty && blockIds.distinct.size == blockIds.size, "invalid shared range")
+      val selected = blockIds.map(id => entries.getOrElse(id,
+        throw new IllegalStateException("shared range crosses arena or missing block")))
+      require(selected.forall(_.state == Writing), "shared range must contain private destinations")
+      selected.sliding(2).foreach { pair =>
+        if (pair.size == 2) require(pair.head.slice.offset.toLong + pair.head.slice.length ==
+          pair.last.slice.offset.toLong, "non-contiguous shared destination range")
+      }
+      val length = Math.toIntExact(selected.iterator.map(_.slice.length.toLong).sum)
+      view(Slice(selected.head.slice.offset, length))
     }
 
     def localShared(blockId: String): Option[PoolSlice] = synchronized {

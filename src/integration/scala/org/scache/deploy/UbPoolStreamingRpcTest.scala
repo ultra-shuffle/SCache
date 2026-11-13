@@ -3,6 +3,7 @@ package org.scache.deploy
 import java.nio.file.{Files, Paths}
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration._
 import org.scache.deploy.DeployMessages._
@@ -25,6 +26,8 @@ object UbPoolStreamingRpcTest {
     conf.set("scache.rpc.askTimeout", "2s")
     val env = RpcEnv.create("stream-test-client", "127.0.0.1", 0, conf, false)
     val submitted = new LinkedBlockingQueue[RpcEndpointRef]()
+    val releaseCalls = new AtomicInteger()
+    val loseReleaseReply = new AtomicBoolean(false)
     env.setupEndpoint("ScacheClient", new ThreadSafeRpcEndpoint {
       override val rpcEnv: RpcEnv = env
       override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
@@ -32,6 +35,10 @@ object UbPoolStreamingRpcTest {
           "127.0.0.1", env.address.port, BlockManagerId("0", "127.0.0.1", env.address.port),
           "ub", true, true, false))
         case GetBlocksIpcStream(_, replyTo) => submitted.add(replyTo); context.reply(true)
+        case ReleaseImportedBlocks(ids) =>
+          assert(ids.size == 2)
+          releaseCalls.incrementAndGet()
+          if (!loseReleaseReply.get()) context.reply(true)
       }
     })
     val daemon = new Daemon(home, "stream-test", DaemonEndpointConfig(
@@ -66,6 +73,14 @@ object UbPoolStreamingRpcTest {
       lateRef.send(IpcBlockReady(1, None, None))
       assert(late.await(1, TimeUnit.SECONDS) && lateCount.get() == 2)
       println("STREAM_REAL_RPC_TIMEOUT_RETAINS_LATE_RESULT_DELIVERY_PASS")
+      assert(daemon.releaseImportedBlocks(ids))
+      assert(releaseCalls.get() == 1)
+      assert(DaemonRpcReplayPolicy.requiresOneShot("ub", "release-imported-blocks"))
+      loseReleaseReply.set(true)
+      val ambiguous = Future(daemon.releaseImportedBlocks(ids))
+      assert(Await.ready(ambiguous, 5.seconds).value.get.isFailure)
+      assert(releaseCalls.get() == 2, "lost batch release reply must not replay reference decrements")
+      println("BATCH_RELEASE_REAL_RPC_AND_NO_REPLAY_ON_LOST_REPLY_PASS")
     } finally {
       daemon.stop(); env.shutdown(); env.awaitTermination()
     }

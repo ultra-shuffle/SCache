@@ -35,7 +35,7 @@ case class DaemonEndpointConfig(
 
 private[deploy] object DaemonRpcReplayPolicy {
   private val statefulPoolOperations = Set(
-    "get-ipc", "get-ipc-batch", "get-ipc-stream", "release-imported-block", "prepare-put-pool",
+    "get-ipc", "get-ipc-batch", "get-ipc-stream", "release-imported-block", "release-imported-blocks", "prepare-put-pool",
     "prepare-put", "prepare-put-batch", "commit-put-pool", "commit-put",
     "commit-put-batch", "abort-put-pool")
 
@@ -547,6 +547,15 @@ class Daemon(
     val parsed = BlockId.apply(blockId)
     if (!parsed.isInstanceOf[ScacheBlockId]) return false
     askClient[Boolean]("release-imported-block", ReleaseImportedBlock(parsed))
+  }
+
+  def releaseImportedBlocks(blockIds: Seq[String]): Boolean = {
+    require(blockIds.size <= 256 && blockIds.distinct.size == blockIds.size,
+      "invalid imported release batch")
+    val parsed = blockIds.map(BlockId.apply)
+    require(parsed.forall(_.isInstanceOf[ScacheBlockId]), "invalid imported block ID")
+    if (parsed.isEmpty) true
+    else askClient[Boolean]("release-imported-blocks", ReleaseImportedBlocks(parsed))
   }
 
   def registerShuffles(jobId: Int, shuffleIds: Array[Int], maps: Array[Int], reduces: Array[Int]): Unit = {
