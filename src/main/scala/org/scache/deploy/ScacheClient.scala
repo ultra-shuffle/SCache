@@ -1091,19 +1091,21 @@ class ScacheClient(
                 case None => true
               }
             }
-            val locations = blockManagerMaster.getLocations(pending.map(_._1).toArray)
-            require(locations.size == pending.size, "UB batch directory reply size mismatch")
-            val routed = pending.zip(locations).map { case ((id, p), owners) =>
-              val owner = owners.find(_ != blockManager.blockManagerId).getOrElse(
-                throw new IllegalStateException("UB batch has no remote owner for " + id))
-              (owner, id, p)
-            }
-            routed.groupBy(_._1).foreach { case (owner, children) =>
-              val slices = ub.fetchBlocksToPool(owner.host, owner.port, children.map(_._2.toString))
-              require(slices.size == children.size, "UB batch result size mismatch")
-              children.zip(slices).foreach { case ((_, id, p), value) =>
-                finish(id, p, Success(value.map(slice => IpcBlock(slice.length,
-                  IpcPoolSlice(slice.path, slice.offset, slice.length)))))
+            if (pending.nonEmpty) {
+              val locations = blockManagerMaster.getLocations(pending.map(_._1).toArray)
+              require(locations.size == pending.size, "UB batch directory reply size mismatch")
+              val routed = pending.zip(locations).map { case ((id, p), owners) =>
+                val owner = owners.find(_ != blockManager.blockManagerId).getOrElse(
+                  throw new IllegalStateException("UB batch has no remote owner for " + id))
+                (owner, id, p)
+              }
+              routed.groupBy(_._1).foreach { case (owner, children) =>
+                val slices = ub.fetchBlocksToPool(owner.host, owner.port, children.map(_._2.toString))
+                require(slices.size == children.size, "UB batch result size mismatch")
+                children.zip(slices).foreach { case ((_, id, p), value) =>
+                  finish(id, p, Success(value.map(slice => IpcBlock(slice.length,
+                    IpcPoolSlice(slice.path, slice.offset, slice.length)))))
+                }
               }
             }
           } finally ubPoolFetchSlots.release()
