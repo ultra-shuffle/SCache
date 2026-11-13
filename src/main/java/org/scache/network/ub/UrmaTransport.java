@@ -1,6 +1,9 @@
 package org.scache.network.ub;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Java wrapper around the native C++ UrmaTransport.
@@ -15,6 +18,12 @@ public final class UrmaTransport implements AutoCloseable {
 
     private long nativeHandle;
     private volatile boolean closed = false;
+    // Completion may overlap a submission, but nativeClose must never free a handle
+    // while a waiter still uses it. All other entry points retain their existing monitor.
+    private final ReentrantReadWriteLock waitLifetime = new ReentrantReadWriteLock(true);
+    private final AtomicInteger activeWaiters = new AtomicInteger();
+    private final AtomicBoolean submitOverlapReported = new AtomicBoolean();
+    private final AtomicBoolean waiterOverlapReported = new AtomicBoolean();
 
     private String deviceName;
     private int localMaxChunkBytes;
@@ -211,6 +220,7 @@ public final class UrmaTransport implements AutoCloseable {
         checkNotClosed();
         checkDirect(message);
         checkBounds(message, offset, length);
+        noteSubmissionDuringWait();
 
         return UrmaNative.nativeSend(nativeHandle, message, offset, length);
     }
@@ -239,6 +249,7 @@ public final class UrmaTransport implements AutoCloseable {
         checkRemote(remote);
         checkDirect(dest);
         checkBounds(dest, offset, totalLength);
+        noteSubmissionDuringWait();
 
         return UrmaNative.nativeReadChunkedMR(nativeHandle,
             remote.remoteAddress, remote.length, remote.token, remote.generation,
@@ -257,11 +268,30 @@ public final class UrmaTransport implements AutoCloseable {
      * @throws UrmaDmaUnresolvedException if provider ownership could not be drained;
      *         registered memory and the remote lease must remain pinned
      */
-    public synchronized int waitFor(long requestId, int timeoutMs) {
-        checkNotClosed();
-        if (requestId <= 0) throw new UrmaException("requestId must be > 0");
-        if (timeoutMs <= 0) throw new UrmaException("timeoutMs must be > 0");
-        return UrmaNative.nativeWait(nativeHandle, requestId, timeoutMs);
+    public int waitFor(long requestId, int timeoutMs) {
+        waitLifetime.readLock().lock();
+        boolean counted = false;
+        try {
+            checkNotClosed();
+            if (requestId <= 0) throw new UrmaException("requestId must be > 0");
+            if (timeoutMs <= 0) throw new UrmaException("timeoutMs must be > 0");
+            int waiting = activeWaiters.incrementAndGet();
+            counted = true;
+            if (waiting > 1 && waiterOverlapReported.compareAndSet(false, true)) {
+                System.err.println("SCACHE_URMA_WAIT_OVERLAP waiters=" + waiting);
+            }
+            return UrmaNative.nativeWait(nativeHandle, requestId, timeoutMs);
+        } finally {
+            if (counted) activeWaiters.decrementAndGet();
+            waitLifetime.readLock().unlock();
+        }
+    }
+
+    private void noteSubmissionDuringWait() {
+        int waiting = activeWaiters.get();
+        if (waiting > 0 && submitOverlapReported.compareAndSet(false, true)) {
+            System.err.println("SCACHE_URMA_SUBMIT_DURING_WAIT waiters=" + waiting);
+        }
     }
 
     // ---- Metrics ----
@@ -276,17 +306,22 @@ public final class UrmaTransport implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        if (closed) return;
-        if (nativeHandle != 0) {
-            long[] raw = UrmaNative.nativeClose(nativeHandle);
-            // Native code intentionally retains the owner if it cannot return
-            // the metrics array. Keep this handle for a later close retry.
-            if (raw == null) throw new UrmaException("native close returned no metrics; retry required");
-            nativeHandle = 0;
+        waitLifetime.writeLock().lock();
+        try {
+            if (closed) return;
+            if (nativeHandle != 0) {
+                long[] raw = UrmaNative.nativeClose(nativeHandle);
+                // Native code intentionally retains the owner if it cannot return
+                // the metrics array. Keep this handle for a later close retry.
+                if (raw == null) throw new UrmaException("native close returned no metrics; retry required");
+                nativeHandle = 0;
+                closed = true;
+                closeMetrics = new TransportMetrics(raw);
+            }
             closed = true;
-            closeMetrics = new TransportMetrics(raw);
+        } finally {
+            waitLifetime.writeLock().unlock();
         }
-        closed = true;
     }
 
     public boolean isClosed() { return closed; }
