@@ -1177,11 +1177,16 @@ void UrmaTransport::refresh_aggregates_locked() {
         }
     }
     for (uint64_t aggregate_id : aggregate_ids) {
+        refresh_aggregate_locked(aggregate_id);
+    }
+}
+
+void UrmaTransport::refresh_aggregate_locked(uint64_t aggregate_id) {
         auto aggregate_it = requests_.find(aggregate_id);
-        if (aggregate_it == requests_.end()) continue;
+        if (aggregate_it == requests_.end()) return;
         RequestRecord& aggregate = aggregate_it->second;
         if (!aggregate.is_aggregate || aggregate.state != RequestState::POSTED ||
-            aggregate.aggregate_building) continue;
+            aggregate.aggregate_building) return;
         bool all_success = !aggregate.children.empty();
         size_t completed = 0;
         for (uint64_t child_id : aggregate.children) {
@@ -1214,7 +1219,6 @@ void UrmaTransport::refresh_aggregates_locked() {
                                 "aggregate completed byte count mismatch");
             }
         }
-    }
 }
 
 CompletionResult UrmaTransport::result_locked(const RequestRecord& request) const {
@@ -1285,7 +1289,12 @@ CompletionResult UrmaTransport::wait(uint64_t request_id, uint32_t timeout_ms) {
                 metrics_.unknown_waits.fetch_add(1);
                 throw std::runtime_error("ERR_UNKNOWN_REQUEST: request id is not known");
             }
-            refresh_aggregates_locked();
+            // Only this waiter's aggregate can affect its return value. CQ
+            // processing still drains/completes every observed child, while
+            // other waiters refresh their own aggregates. Keep the global
+            // refresh for close(), not for every polling iteration over a
+            // potentially large cache of historical terminal results.
+            refresh_aggregate_locked(request_id);
             it = requests_.find(request_id);
             const auto now = std::chrono::steady_clock::now();
             if (it->second.state == RequestState::POSTED && now >= deadline) {

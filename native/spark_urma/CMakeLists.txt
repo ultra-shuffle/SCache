@@ -162,7 +162,7 @@ if(BUILD_TESTS)
         add_test(NAME provider_context_test COMMAND provider_context_test)
         set_tests_properties(provider_context_test PROPERTIES LABELS "offline-context" TIMEOUT 15)
     endif()
-    foreach(contract local_va_contract_test rm_ctp_dma_lifetime_test rm_ctp_post_ownership_test rm_ctp_mr_import_test rm_ctp_connect_test rm_ctp_init_test registration_diagnostics_test)
+    foreach(contract local_va_contract_test rm_ctp_dma_lifetime_test rm_ctp_post_ownership_test rm_ctp_mr_import_test rm_ctp_connect_test rm_ctp_init_test registration_diagnostics_test targeted_completion_test)
         add_executable(${contract} tests/${contract}.cpp $<TARGET_OBJECTS:spark_urma_obj>)
         target_include_directories(${contract} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include ${URMA_INC} ${URMA_COMMON_INC})

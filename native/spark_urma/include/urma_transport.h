@@ -193,6 +193,7 @@ private:
     void provider_drained_locked(RequestRecord& request);
     void poll_once_locked();
     void refresh_aggregates_locked();
+    void refresh_aggregate_locked(uint64_t aggregate_id);
     CompletionResult result_locked(const RequestRecord& request) const;
     bool provider_owned_locked(const RequestRecord& request) const;
     void retire_drained_children_locked(RequestRecord& request);
