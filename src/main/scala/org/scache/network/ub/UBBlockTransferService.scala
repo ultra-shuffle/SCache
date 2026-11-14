@@ -104,6 +104,9 @@ private[scache] class UBBlockTransferService(
   private val batchConsumerReleases = new AtomicLong(0L)
   private val batchReadOperations = new AtomicLong(0L)
   private val batchReadBlocks = new AtomicLong(0L)
+  private val batchSourceBreaks = new AtomicLong(0L)
+  private val batchDestinationBreaks = new AtomicLong(0L)
+  private val batchLimitBreaks = new AtomicLong(0L)
   private val readBatchBytes = math.max(1L,
     conf.getSizeAsBytes("scache.ub.pool.batchReadBytes", "4m"))
   private val sharedPoolDestinationBytes = new AtomicLong(0L)
@@ -216,6 +219,8 @@ private[scache] class UBBlockTransferService(
         transport, arenaBytes, arenaCount, nodeId, epoch, leaseTimeoutMs,
         if (sharedPoolEnabled) Some(sharedPoolDirectory) else None,
         sharedPoolForceOnCommit, sharedPoolChecksumEnabled)
+      arena.configureContiguousDestinations(
+        conf.getBoolean("scache.ub.pool.contiguousDestinations", false))
       endpoint = transport.localEndpoint()
       server = new ServerSocket(conf.getInt("spark.urma.controlPort", 0), 64,
         InetAddress.getByName(controlBindHost))
@@ -463,12 +468,17 @@ private[scache] class UBBlockTransferService(
           val join = groups.lastOption.exists { group =>
             val (prev, dest) = group.last
             val (next, nextDest) = item
-            prev.segment == next.segment && prev.arenaId == next.arenaId &&
+            val sourceAdjacent = prev.segment == next.segment && prev.arenaId == next.arenaId &&
               prev.baseAddress == next.baseAddress && prev.token == next.token &&
               prev.segmentGeneration == next.segmentGeneration &&
-              prev.offset.toLong + prev.length == next.offset.toLong &&
-              dest.path == nextDest.path && dest.offset + dest.length == nextDest.offset &&
-              group.iterator.map(_._1.length.toLong).sum + next.length <= readBatchBytes
+              prev.offset.toLong + prev.length == next.offset.toLong
+            val destinationAdjacent = dest.path == nextDest.path &&
+              dest.offset + dest.length == nextDest.offset
+            val withinLimit = group.iterator.map(_._1.length.toLong).sum + next.length <= readBatchBytes
+            if (!sourceAdjacent) batchSourceBreaks.incrementAndGet()
+            if (!destinationAdjacent) batchDestinationBreaks.incrementAndGet()
+            if (!withinLimit) batchLimitBreaks.incrementAndGet()
+            sourceAdjacent && destinationAdjacent && withinLimit
           }
           if (join) groups.last += item else groups += mutable.ArrayBuffer(item)
         }
@@ -1388,6 +1398,11 @@ private[scache] class UBBlockTransferService(
       "urma.batchConsumerReleases" -> batchConsumerReleases.get(),
       "urma.batchReadOperations" -> batchReadOperations.get(),
       "urma.batchReadBlocks" -> batchReadBlocks.get(),
+      "urma.batchSourceBreaks" -> batchSourceBreaks.get(),
+      "urma.batchDestinationBreaks" -> batchDestinationBreaks.get(),
+      "urma.batchLimitBreaks" -> batchLimitBreaks.get(),
+      "urma.destinationSpanAllocations" -> (if (arena == null) 0L else arena.destinationSpanAllocations),
+      "urma.destinationSpanFallbacks" -> (if (arena == null) 0L else arena.destinationSpanFallbacks),
       "urma.sharedPoolDestinationBytes" -> sharedPoolDestinationBytes.get(),
       "urma.sharedPoolDestinationIdentityMatches" -> sharedPoolDestinationIdentityMatches.get(),
       "urma.sharedPoolDestinationIdentityMismatches" -> sharedPoolDestinationIdentityMismatches.get(),
@@ -1822,6 +1837,16 @@ private[ub] object UBBlockTransferService {
     }
     val capacity: Int = bytesPerArena
     val totalCapacity: Long = bytesPerArena.toLong * arenaCount
+    private var contiguousDestinations = false
+    private val destinationSpans = new AtomicLong(0L)
+    private val destinationFallbacks = new AtomicLong(0L)
+    def destinationSpanAllocations: Long = destinationSpans.get()
+    def destinationSpanFallbacks: Long = destinationFallbacks.get()
+    def configureContiguousDestinations(enabled: Boolean): Unit = synchronized {
+      require(arenas.forall(_.freeBytes == bytesPerArena.toLong),
+        "configure destination allocation before any arena is in use")
+      contiguousDestinations = enabled
+    }
     final class PoolScratch(val owner: RegisteredArena, val scratch: RegisteredArena#Scratch) {
       def buffer: ByteBuffer = scratch.buffer
       def free(): Unit = owner.freeScratch(scratch.asInstanceOf[owner.Scratch])
@@ -1847,6 +1872,20 @@ private[ub] object UBBlockTransferService {
     def prepareSharedBatch(blocks: Seq[(String, Int)], ownerPeer: String): Seq[PoolSlice] = synchronized {
       require(blocks.size <= MaxBatchBlocks && blocks.map(_._1).distinct.size == blocks.size,
         "invalid destination allocation batch")
+      require(blocks.forall(_._2 >= 0), "negative destination length")
+      blocks.foreach { case (id, _) => require(!arenas.exists(_.containsBlock(id)),
+        "destination batch must own a new single-flight block") }
+      if (contiguousDestinations && blocks.nonEmpty) {
+        val needed = blocks.iterator.map(x => math.max(1, x._2).toLong).sum
+        val target = if (needed <= bytesPerArena) arenas.find(_.canAllocate(needed.toInt)) else None
+        target match {
+          case Some(owner) =>
+            val result = owner.prepareSharedContiguousBatch(blocks, ownerPeer)
+            destinationSpans.incrementAndGet()
+            return result
+          case None => destinationFallbacks.incrementAndGet() // Fragmented capacity remains usable.
+        }
+      }
       val allocated = mutable.ArrayBuffer.empty[(RegisteredArena, String, PoolSlice)]
       try {
         blocks.foreach { case (id, length) =>
@@ -2042,6 +2081,43 @@ private[ub] object UBBlockTransferService {
       if (sharedPath.isEmpty) throw new IllegalStateException("UB shared arena is disabled")
       val descriptor = prepare(blockId, length, -1L, 0, 1, ownerPeer)
       PoolSlice(sharedPath.get, descriptor.offset, descriptor.length, descriptor.generation)
+    }
+
+    /** One allocator reservation, independent sub-slices/refcounts/generations. Never copy
+      * bytes to obtain adjacency. If no span fits, the pool uses the original allocator.
+      */
+    def prepareSharedContiguousBatch(blocks: Seq[(String, Int)], ownerPeer: String): Seq[PoolSlice] = synchronized {
+      require(sharedPath.nonEmpty && blocks.nonEmpty && blocks.size <= MaxBatchBlocks)
+      require(blocks.map(_._1).distinct.size == blocks.size && blocks.forall(_._2 >= 0))
+      if (closing) throw new IllegalStateException("UB arena is closing")
+      require(blocks.forall(x => !entries.contains(x._1)), "duplicate destination block")
+      val needed = Math.toIntExact(blocks.iterator.map(x => math.max(1, x._2).toLong).sum)
+      val span = allocate(needed)
+      val created = mutable.ArrayBuffer.empty[(Entry, Lease)]
+      try {
+        var offset = span.offset
+        blocks.foreach { case (id, length) =>
+          val entry = Entry(id, Slice(offset, length), generation(), -1L, 0, 1, Writing, 1, length)
+          val now = System.nanoTime()
+          val lease = Lease(UUID.randomUUID().toString, entry, now,
+            now + leaseTimeoutMs.toLong * 1000000L, ownerPeer, "WRITING")
+          created += ((entry, lease))
+          offset = Math.addExact(offset, math.max(1, length))
+        }
+        // All metadata allocated before exposing any of the new entries.
+        created.foreach { case (entry, lease) =>
+          entries.put(entry.blockId, entry); leases.put(lease.leaseId, lease)
+        }
+        created.map { case (entry, _) => PoolSlice(sharedPath.get,
+          entry.slice.offset, entry.slice.length, entry.generation) }.toVector
+      } catch {
+        case NonFatal(e) =>
+          created.foreach { case (entry, lease) =>
+            entries.remove(entry.blockId); leases.remove(lease.leaseId)
+          }
+          releaseSlice(span)
+          throw e
+      }
     }
 
     /** Return a duplicate view of the mapped slice; no bytes are copied. */

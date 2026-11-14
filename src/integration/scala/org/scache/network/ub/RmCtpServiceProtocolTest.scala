@@ -95,7 +95,7 @@ object RmCtpServiceProtocolTest {
     val f = classOf[UBBlockTransferService].getDeclaredField(name); f.setAccessible(true); f
   }
   private def start(label: String, strict: Boolean = false, window: Int = 1048576,
-      arenaCapacity: Int = 1048576): UBBlockTransferService = {
+      arenaCapacity: Int = 1048576, contiguous: Boolean = false): UBBlockTransferService = {
     val home = Files.createTempDirectory("scache-service-contract-")
     Files.createDirectory(home.resolve("conf")); Files.createDirectory(home.resolve("pool"))
     Files.writeString(home.resolve("conf/log4j.properties"), "log4j.rootLogger=OFF\n")
@@ -111,6 +111,7 @@ object RmCtpServiceProtocolTest {
     val t = new CopyTransport
     val pool = new UBBlockTransferService.RegisteredArenaPool(t, arenaCapacity, 3, label,
       field(s, "epoch").getLong(s), 30000, Some(home.resolve("pool").toString))
+    pool.configureContiguousDestinations(contiguous)
     val socket = new ServerSocket(0, 64, InetAddress.getLoopbackAddress)
     field(s, "transport").set(s, t); field(s, "arena").set(s, pool)
     field(s, "endpoint").set(s, t.localEndpoint()); field(s, "server").set(s, socket)
@@ -213,7 +214,112 @@ object RmCtpServiceProtocolTest {
         "failed batch must not partially reserve earlier IDs")
       println("BATCH_RESERVATION_DUPLICATE_REFS_AND_ATOMIC_REJECTION_PASS")
     } finally reservations.close()
+    contiguousDestinationAllocator()
+    contiguousDestinationService()
     println("RM_CTP_SERVICE_PROTOCOL_PASS blocks=6 (two services; TCP control; test memory copy; NOT UB)")
+  }
+
+  private def contiguousDestinationAllocator(): Unit = {
+    for (fragmentAll <- Seq(false, true)) {
+      val dir = Files.createTempDirectory("destination-span-contract-")
+      val pool = new UBBlockTransferService.RegisteredArenaPool(new CopyTransport,
+        256, 3, "span-contract", 1L, 30000, Some(dir.toString))
+      val retained = scala.collection.mutable.ArrayBuffer.empty[String]
+      try {
+        pool.configureContiguousDestinations(true)
+        val holes = scala.collection.mutable.ArrayBuffer.empty[String]
+        for (arena <- 0 until (if (fragmentAll) 3 else 1)) {
+          for ((kind, size) <- Seq("hole0" -> 16, "keep0" -> 16, "hole1" -> 16, "keep1" -> 208)) {
+            val id = s"$arena-$kind"
+            pool.publish(id, Array.fill[Byte](size)(7))
+            if (kind.startsWith("hole")) holes += id else retained += id
+          }
+        }
+        holes.foreach(pool.unpublish(_, 1000))
+        val before = pool.freeBytes
+        val ids = Vector("span-child-a", "span-child-b")
+        val slices = pool.prepareSharedBatch(ids.map(_ -> 16), "remote-fetch")
+        val adjacent = slices(0).path == slices(1).path && slices(0).offset + 16 == slices(1).offset
+        require(adjacent != fragmentAll)
+        require(pool.destinationSpanAllocations == (if (fragmentAll) 0 else 1))
+        require(pool.destinationSpanFallbacks == (if (fragmentAll) 1 else 0))
+        ids.zip(slices).reverse.foreach { case (id, slice) =>
+          pool.abortShared(id, slice.path, slice.offset, slice.length, "remote-fetch")
+        }
+        require(pool.freeBytes == before && pool.activeLeases == 0,
+          "independent sub-slice abort leaked or double-freed a span")
+        var rejected = false
+        try pool.prepareSharedBatch(Vector("duplicate" -> 16, "duplicate" -> 16), "remote-fetch")
+        catch { case _: IllegalArgumentException => rejected = true }
+        require(rejected && pool.freeBytes == before)
+        retained.foreach(pool.unpublish(_, 1000))
+        require(pool.freeBytes == 768 && pool.activeLeases == 0)
+        // Empty blocks still own one allocator byte each. Free the middle
+        // child first to exercise sub-slice coalescing in a non-stack order.
+        val emptyIds = Vector("empty-a", "one-byte", "empty-b")
+        val emptySlices = pool.prepareSharedBatch(emptyIds.zip(Vector(0, 1, 0)), "remote-fetch")
+        require(emptySlices.map(_.length) == Vector(0, 1, 0))
+        require(emptySlices.map(_.path).distinct.size == 1)
+        require(emptySlices(1).offset == emptySlices(0).offset + 1 &&
+          emptySlices(2).offset == emptySlices(1).offset + 1)
+        require(pool.freeBytes == 765 && pool.activeLeases == 3)
+        for (i <- Vector(1, 0, 2)) {
+          val slice = emptySlices(i)
+          pool.abortShared(emptyIds(i), slice.path, slice.offset, slice.length, "remote-fetch")
+        }
+        require(pool.freeBytes == 768 && pool.activeLeases == 0)
+        // No single arena fits the whole batch; the fallback allocates three
+        // children then fails. None of those private reservations may leak.
+        var exhausted = false
+        try pool.prepareSharedBatch(Vector.tabulate(4)(i => s"exhausted-$i" -> 256), "remote-fetch")
+        catch { case _: IllegalStateException => exhausted = true }
+        require(exhausted && pool.freeBytes == 768 && pool.activeLeases == 0)
+        // Retry the same IDs proves rollback removed entries as well as bytes.
+        val retried = pool.prepareSharedBatch(Vector("exhausted-0" -> 256), "remote-fetch").head
+        pool.abortShared("exhausted-0", retried.path, retried.offset, retried.length, "remote-fetch")
+        require(pool.freeBytes == 768 && pool.activeLeases == 0)
+        println(s"DESTINATION_SPAN_FRAGMENTATION_FALLBACK_AND_REVERSE_RELEASE_PASS fragmentedAll=$fragmentAll")
+      } finally pool.close(1000)
+    }
+  }
+
+  private def contiguousDestinationService(): Unit = {
+    val source = start("span-source"); val dest = start("span-dest", contiguous = true)
+    val copy = field(dest, "transport").get(dest).asInstanceOf[CopyTransport]
+    val ids = Vector.tabulate(3)(i => ScacheBlockId("span-data", 1, 1, 0, i))
+    val bytes = Vector(64, 8193, 33).map(n => Array.tabulate[Byte](n)(i => (i * 23).toByte))
+    try {
+      ids.zip(bytes).foreach { case (id, data) => source.publishBlock(id, data) }
+      for (fault <- Seq("submit", "crc", "none")) {
+        dest.reservePoolConsumers(ids)
+        copy.rejectNextRead = fault == "submit"; copy.corruptNextRead = fault == "crc"
+        var failed = false
+        try {
+          val slices = dest.fetchBlocksToPool("127.0.0.1", source.port, ids.map(_.toString))
+          require(fault == "none", "injected span fault was accepted")
+          slices.zip(bytes).foreach { case (value, expected) =>
+            val slice = value.get
+            val channel = FileChannel.open(java.nio.file.Paths.get(slice.path), StandardOpenOption.READ)
+            try {
+              val actual = ByteBuffer.allocate(slice.length); var offset = slice.offset
+              while (actual.hasRemaining) { val n = channel.read(actual, offset); require(n > 0); offset += n }
+              require(java.util.Arrays.equals(actual.array(), expected), "span returned incorrect bytes")
+            } finally channel.close()
+          }
+          require(dest.releaseImportedPoolBlocks(ids))
+        } catch { case e: IllegalStateException =>
+          require(fault != "none")
+          require(e.getMessage.contains(if (fault == "submit") "TEST_READ_REJECTED" else "CRC mismatch"))
+          failed = true; ids.foreach(dest.cancelPoolConsumer)
+        }
+        require(failed == (fault != "none"))
+        require(dest.urmaMetrics("urma.arenaFreeBytes") == 3L * 1048576)
+        require(source.urmaMetrics("urma.activeLeases") == 0)
+      }
+      ids.foreach(source.unpublishBlock)
+      require(dest.urmaMetrics("urma.destinationSpanAllocations") == 3)
+      println("DESTINATION_SPAN_REAL_SERVICE_BYTES_SUBMIT_CRC_ROLLBACK_RETRY_PASS (test copy; NOT hardware UB)")
+    } finally { try source.close() finally dest.close() }
   }
 
   private def ordinaryWindowReads(window: Int): Unit = {
