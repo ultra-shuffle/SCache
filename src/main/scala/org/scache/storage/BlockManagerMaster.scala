@@ -78,6 +78,12 @@ class BlockManagerMaster(
     res
   }
 
+  def updateBlockInfos(id: BlockManagerId,
+      blocks: Vector[(BlockId, StorageLevel, Long, Long)]): Boolean = {
+    require(blocks.nonEmpty && blocks.size <= 256, "Invalid directory batch size")
+    driverEndpoint.askWithRetry[Boolean](UpdateBlockInfos(id, blocks))
+  }
+
   /** Get locations of the blockId from the driver */
   def getLocations(blockId: BlockId): Seq[BlockManagerId] = {
     driverEndpoint.askWithRetry[Seq[BlockManagerId]](GetLocations(blockId))

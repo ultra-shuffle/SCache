@@ -106,6 +106,10 @@ private[scache] object BlockManagerMessages {
 
   case object GetPrefetchResults extends ToBlockManagerMaster
 
+  // Idempotent directory updates; payload contains metadata only, never block bytes.
+  case class UpdateBlockInfos(blockManagerId: BlockManagerId,
+      blocks: Vector[(BlockId, StorageLevel, Long, Long)]) extends ToBlockManagerMaster
+
   case class UpdateBlockInfo(
       var blockManagerId: BlockManagerId,
       var blockId: BlockId,

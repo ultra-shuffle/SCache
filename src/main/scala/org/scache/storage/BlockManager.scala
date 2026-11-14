@@ -1004,7 +1004,12 @@ private[scache] class BlockManager(
       blockId: BlockId,
       size: Int,
       level: StorageLevel = StorageLevel.MEMORY_ONLY,
-      tellMaster: Boolean = true): Boolean = {
+      tellMaster: Boolean = true): Boolean =
+    registerExternalBlockDeferred(blockId, size, level, tellMaster, false)
+
+  private[scache] def registerExternalBlockDeferred(
+      blockId: BlockId, size: Int, level: StorageLevel,
+      tellMaster: Boolean, deferMasterReport: Boolean): Boolean = {
     require(size >= 0, s"External block size must be non-negative: $blockId/$size")
     require(ubSharedPoolEnabled,
       "External blocks require scache.ub.pool.enabled=true")
@@ -1012,7 +1017,7 @@ private[scache] class BlockManager(
       info.size = size
       info.level = level
       externalBlockSizes.synchronized { externalBlockSizes.put(blockId, size.toLong) }
-      if (tellMaster) {
+      if (tellMaster && !deferMasterReport) {
         try {
           reportBlockStatus(blockId, info, BlockStatus(level, memSize = size.toLong, diskSize = 0L))
         } catch {
@@ -1023,6 +1028,21 @@ private[scache] class BlockManager(
       }
       None
     }.isEmpty
+  }
+
+  private[scache] def reportExternalBlocks(ids: Seq[BlockId]): Unit = {
+    ids.grouped(256).foreach { group =>
+      val entries = externalBlockSizes.synchronized {
+        group.map { id =>
+          val size = externalBlockSizes.getOrElse(id,
+            throw new IllegalStateException("Missing committed external block: " + id))
+          (id, StorageLevel.MEMORY_ONLY, size, 0L)
+        }.toVector
+      }
+      if (!master.updateBlockInfos(blockManagerId, entries)) {
+        throw new IllegalStateException("Master rejected external block directory batch")
+      }
+    }
   }
 
   /**
@@ -1773,7 +1793,9 @@ private[scache] class BlockManager(
           // Removals are idempotent in disk store and memory store. At worst, we get a warning.
           val removedFromMemory = memoryStore.remove(blockId)
           val removedFromDisk = diskStore.remove(blockId)
-          if (!removedFromMemory && !removedFromDisk) {
+          val wasExternal = externalBlockSizes.synchronized(externalBlockSizes.contains(blockId))
+          if (!removedFromMemory && !removedFromDisk &&
+              (!wasExternal || conf.getBoolean("scache.ub.verboseBlockLogs", true))) {
             logWarning(s"Block $blockId could not be removed as it was not found in either " +
               "the disk, memory, or external block store")
           }

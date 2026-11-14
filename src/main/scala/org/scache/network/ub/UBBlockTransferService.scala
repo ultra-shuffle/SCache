@@ -110,6 +110,30 @@ private[scache] class UBBlockTransferService(
   private val sharedPoolDestinationIdentityMatches = new AtomicLong(0L)
   private val sharedPoolDestinationIdentityMismatches = new AtomicLong(0L)
   private val sharedPoolConsumerReservations = new AtomicLong(0L)
+  private val consumerReservationCalls = new AtomicLong(0L)
+  private val directoryPublishCalls = new AtomicLong(0L)
+  private val directoryPublishBlocks = new AtomicLong(0L)
+  private val ipcCompletionMessages = new AtomicLong(0L)
+  private val ipcCompletionBlocks = new AtomicLong(0L)
+  private val pipelineTimers = Seq("producerCommit", "fetchQueue", "directoryLookup",
+    "fetchToPool", "ipcSend", "nativeWait", "controlAcquire", "controlRelease")
+    .map(name => name -> (new AtomicLong(0L), new AtomicLong(0L))).toMap
+
+  private[scache] def recordPipelineTime(name: String, nanos: Long): Unit = {
+    val (time, count) = pipelineTimers(name)
+    time.addAndGet(nanos); count.incrementAndGet()
+  }
+  private[scache] def timedPipeline[T](name: String)(body: => T): T = {
+    val started = System.nanoTime()
+    try body finally recordPipelineTime(name, System.nanoTime() - started)
+  }
+
+  private[scache] def recordDirectoryPublish(blocks: Int): Unit = {
+    directoryPublishCalls.incrementAndGet(); directoryPublishBlocks.addAndGet(blocks)
+  }
+  private[scache] def recordIpcCompletion(blocks: Int): Unit = {
+    ipcCompletionMessages.incrementAndGet(); ipcCompletionBlocks.addAndGet(blocks)
+  }
   private val sharedPoolMultiConsumerReservations = new AtomicLong(0L)
   private val sharedPoolDeferredReleases = new AtomicLong(0L)
   private val activeControlConnections = new AtomicLong(0L)
@@ -415,7 +439,7 @@ private[scache] class UBBlockTransferService(
     require(sharedPoolEnabled, "UB batch requires shared pool")
     blockIds.foreach(id => importedSharedBlocks.synchronized { rejectRetiredPoolBlock(id) })
     withControl(host, remotePort) { (channel, peer) =>
-      val grants = channel.exchange(AcquireBatch(blockIds)) match {
+      val grants = timedPipeline("controlAcquire") { channel.exchange(AcquireBatch(blockIds)) } match {
         case Grants(values) if values.size == blockIds.size => values
         case other => throw new IllegalStateException(s"UB batch ACQUIRE failed: $other")
       }
@@ -466,7 +490,9 @@ private[scache] class UBBlockTransferService(
           }
           value
         }
-        channel.exchange(ReleaseBatch(grants.flatten.map(d => (d.leaseId, d.generation)))) match {
+        timedPipeline("controlRelease") {
+          channel.exchange(ReleaseBatch(grants.flatten.map(d => (d.leaseId, d.generation))))
+        } match {
           case Ack => released = true
           case other => throw new IllegalStateException(s"UB batch RELEASE failed: $other")
         }
@@ -508,6 +534,7 @@ private[scache] class UBBlockTransferService(
 
   /** Reserve one eventual Spark consumer before entering the single-flight fetch. */
   private[scache] def reservePoolConsumer(blockId: BlockId): Unit = {
+    consumerReservationCalls.incrementAndGet()
     require(blockId != null, "UB pool consumer blockId must not be null")
     val name = blockId.toString
     importedSharedBlocks.synchronized {
@@ -516,6 +543,24 @@ private[scache] class UBBlockTransferService(
       sharedPoolConsumerRefs.update(name, previous + 1)
       sharedPoolConsumerReservations.incrementAndGet()
       if (previous > 0) sharedPoolMultiConsumerReservations.incrementAndGet()
+    }
+  }
+
+  /** Preserve one reference per consumer, but acquire the metadata monitor once per batch.
+    * Validate the entire batch before mutating any refcount, including duplicate identities.
+    */
+  private[scache] def reservePoolConsumers(blockIds: Seq[BlockId]): Unit = {
+    require(blockIds.nonEmpty && blockIds.size <= 256 && blockIds.forall(_ != null))
+    val names = blockIds.map(_.toString)
+    importedSharedBlocks.synchronized {
+      names.foreach(rejectRetiredPoolBlock)
+      names.foreach { name =>
+        val previous = sharedPoolConsumerRefs.getOrElse(name, 0)
+        sharedPoolConsumerRefs.update(name, previous + 1)
+        if (previous > 0) sharedPoolMultiConsumerReservations.incrementAndGet()
+      }
+      sharedPoolConsumerReservations.addAndGet(names.size)
+      consumerReservationCalls.incrementAndGet()
     }
   }
 
@@ -1010,7 +1055,7 @@ private[scache] class UBBlockTransferService(
   private def await(request: Long, bytes: Int, isRead: Boolean): Unit = {
     lastNativeRequestId.set(request)
     try {
-      val status = transport.waitFor(request, timeoutMs)
+      val status = timedPipeline("nativeWait") { transport.waitFor(request, timeoutMs) }
       if (status != 0) throw new IllegalStateException(s"URMA completion status=$status")
       val rawOperationBytes = transport.capabilities().maxRawOperationBytes
       completedChunks.addAndGet((bytes.toLong + rawOperationBytes - 1L) / rawOperationBytes)
@@ -1347,6 +1392,11 @@ private[scache] class UBBlockTransferService(
       "urma.sharedPoolDestinationIdentityMatches" -> sharedPoolDestinationIdentityMatches.get(),
       "urma.sharedPoolDestinationIdentityMismatches" -> sharedPoolDestinationIdentityMismatches.get(),
       "urma.sharedPoolConsumerReservations" -> sharedPoolConsumerReservations.get(),
+      "urma.consumerReservationCalls" -> consumerReservationCalls.get(),
+      "urma.directoryPublishCalls" -> directoryPublishCalls.get(),
+      "urma.directoryPublishBlocks" -> directoryPublishBlocks.get(),
+      "urma.ipcCompletionMessages" -> ipcCompletionMessages.get(),
+      "urma.ipcCompletionBlocks" -> ipcCompletionBlocks.get(),
       "urma.sharedPoolMultiConsumerReservations" -> sharedPoolMultiConsumerReservations.get(),
       "urma.sharedPoolDeferredReleases" -> sharedPoolDeferredReleases.get(),
       "urma.sharedPoolChecksumEnabled" -> (if (sharedPoolChecksumEnabled) 1L else 0L),
@@ -1385,7 +1435,10 @@ private[scache] class UBBlockTransferService(
       "urma.nativeInflight" -> native.map(backend(_, "inflightRequests")).getOrElse(0L),
       "urma.registeredRegions" -> native.map(_.registeredRegions).getOrElse(0L),
       "urma.activeImports" -> native.map(backend(_, "activeImports")).getOrElse(0L),
-      "urma.activeTransports" -> native.map(backend(_, "activeTransports")).getOrElse(0L))
+      "urma.activeTransports" -> native.map(backend(_, "activeTransports")).getOrElse(0L)) ++
+      pipelineTimers.flatMap { case (name, (time, count)) => Map(
+        ("urma.pipeline." + name + "Nanos") -> time.get(),
+        ("urma.pipeline." + name + "Calls") -> count.get()) }
   }
 
   private def crc(buffer: ByteBuffer, length: Int): Long = UBBlockTransferService.crc(buffer, length)

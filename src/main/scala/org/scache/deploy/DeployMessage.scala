@@ -51,6 +51,7 @@ private[deploy] object DeployMessages {
     extends FromDaemon
   case class IpcBlockReady(index: Int, result: Option[IpcBlock], error: Option[String])
     extends Serializable
+  case class IpcBlocksReady(results: Vector[IpcBlockReady]) extends Serializable
   // Reducer-side pool slices are transient destinations. Spark sends this after the
   // corresponding ManagedBuffer has been consumed so the arena can be reused immediately.
   case class ReleaseImportedBlock(scacheBlockId: BlockId) extends FromDaemon

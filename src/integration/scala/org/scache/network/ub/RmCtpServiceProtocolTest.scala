@@ -195,6 +195,24 @@ object RmCtpServiceProtocolTest {
     shuffleCleanupRejectsLateFetch()
     shuffleCleanupRejectsLateOwnerCommit()
     applicationCleanupIsScoped()
+    val reservations = start("reservation-batch")
+    try {
+      val id = ScacheBlockId("batch-ref", 1, 1, 0, 0)
+      reservations.reservePoolConsumers(Vector(id, id))
+      require(reservations.urmaMetrics("urma.consumerReservationCalls") == 1)
+      require(reservations.urmaMetrics("urma.sharedPoolConsumerReservations") == 2)
+      require(reservations.releaseImportedPoolBlock(id))
+      require(reservations.releaseImportedPoolBlock(id))
+      require(!reservations.releaseImportedPoolBlock(id))
+      val retired = ScacheBlockId("retired-ref", 1, 1, 0, 0)
+      reservations.retireApplicationNamespace("retired-ref")
+      var rejected = false
+      try reservations.reservePoolConsumers(Vector(id, retired))
+      catch { case _: IllegalStateException => rejected = true }
+      require(rejected && !reservations.releaseImportedPoolBlock(id),
+        "failed batch must not partially reserve earlier IDs")
+      println("BATCH_RESERVATION_DUPLICATE_REFS_AND_ATOMIC_REJECTION_PASS")
+    } finally reservations.close()
     println("RM_CTP_SERVICE_PROTOCOL_PASS blocks=6 (two services; TCP control; test memory copy; NOT UB)")
   }
 

@@ -143,6 +143,14 @@ class BlockManagerMasterEndpoint(
     case GetPrefetchResults =>
       context.reply(prefetchResults.synchronized(prefetchResults.toVector))
 
+    case UpdateBlockInfos(id, blocks) =>
+      require(blocks.nonEmpty && blocks.size <= 256, "Invalid directory batch size")
+      // Evaluate all entries, even if an earlier entry reports an unregistered owner.
+      val results = blocks.map { case (block, level, mem, disk) =>
+        updateBlockInfo(id, block, level, mem, disk)
+      }
+      context.reply(results.forall(identity))
+
     case _updateBlockInfo @
         UpdateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size) =>
       context.reply(updateBlockInfo(blockManagerId, blockId, storageLevel, deserializedSize, size))
@@ -750,7 +758,8 @@ class BlockManagerMasterEndpoint(
       blockManagerIdByExecutor(id.executorId) = id
 
       blockManagerInfo(id) = new BlockManagerInfo(
-        id, System.currentTimeMillis(), maxMemSize, slaveEndpoint, capability)
+        id, System.currentTimeMillis(), maxMemSize, slaveEndpoint, capability,
+        conf.getBoolean("scache.ub.verboseBlockLogs", true))
     } else {
       blockManagerInfo(id).capability = capability
     }
@@ -1074,7 +1083,8 @@ private[scache] class BlockManagerInfo(
     timeMs: Long,
     val maxMem: Long,
     val slaveEndpoint: RpcEndpointRef,
-    var capability: BlockManagerCapability)
+    var capability: BlockManagerCapability,
+    verboseBlockLogs: Boolean = true)
   extends Logging {
 
   private var _lastSeenMs: Long = timeMs
@@ -1123,14 +1133,14 @@ private[scache] class BlockManagerInfo(
         blockStatus = BlockStatus(storageLevel, memSize = memSize, diskSize = 0)
         _blocks.put(blockId, blockStatus)
         _remainingMem -= memSize
-        logInfo("Added %s in memory on %s (size: %s, free: %s)".format(
+        if (verboseBlockLogs) logInfo("Added %s in memory on %s (size: %s, free: %s)".format(
           blockId, blockManagerId.hostPort, Utils.bytesToString(memSize),
           Utils.bytesToString(_remainingMem)))
       }
       if (storageLevel.useDisk) {
         blockStatus = BlockStatus(storageLevel, memSize = 0, diskSize = diskSize)
         _blocks.put(blockId, blockStatus)
-        logInfo("Added %s on disk on %s (size: %s)".format(
+        if (verboseBlockLogs) logInfo("Added %s on disk on %s (size: %s)".format(
           blockId, blockManagerId.hostPort, Utils.bytesToString(diskSize)))
       }
       if (!blockId.isBroadcast && blockStatus.isCached) {
@@ -1142,12 +1152,12 @@ private[scache] class BlockManagerInfo(
       _blocks.remove(blockId)
       _cachedBlocks -= blockId
       if (blockStatus.storageLevel.useMemory) {
-        logInfo("Removed %s on %s in memory (size: %s, free: %s)".format(
+        if (verboseBlockLogs) logInfo("Removed %s on %s in memory (size: %s, free: %s)".format(
           blockId, blockManagerId.hostPort, Utils.bytesToString(blockStatus.memSize),
           Utils.bytesToString(_remainingMem)))
       }
       if (blockStatus.storageLevel.useDisk) {
-        logInfo("Removed %s on %s on disk (size: %s)".format(
+        if (verboseBlockLogs) logInfo("Removed %s on %s on disk (size: %s)".format(
           blockId, blockManagerId.hostPort, Utils.bytesToString(blockStatus.diskSize)))
       }
     }

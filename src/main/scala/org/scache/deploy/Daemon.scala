@@ -512,8 +512,8 @@ class Daemon(
     val endpoint = new ThreadSafeRpcEndpoint {
       override val rpcEnv: RpcEnv = Daemon.this.rpcEnv
       private var remaining = blockIds.size
-      override def receive: PartialFunction[Any, Unit] = {
-        case IpcBlockReady(index, result, error) =>
+      private def acceptReady(value: IpcBlockReady): Unit = {
+          val IpcBlockReady(index, result, error) = value
           if (index < 0 || index >= blockIds.size) {
             done.tryFailure(new IllegalStateException("Invalid IPC completion index " + index))
           } else if (!received.get(index)) {
@@ -530,6 +530,10 @@ class Daemon(
               stop()
             }
           }
+      }
+      override def receive: PartialFunction[Any, Unit] = {
+        case value: IpcBlockReady => acceptReady(value)
+        case IpcBlocksReady(values) => values.foreach(acceptReady)
       }
     }
     val ref = rpcEnv.setupEndpoint("ub-ipc-stream-" + requestSequence.incrementAndGet(), endpoint)

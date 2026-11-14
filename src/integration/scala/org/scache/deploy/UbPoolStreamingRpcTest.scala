@@ -64,6 +64,17 @@ object UbPoolStreamingRpcTest {
       assert(count.get() == 2 && first.getCount == 0)
       println("STREAM_REAL_RPC_EARLY_DELIVERY_OUT_OF_ORDER_DUPLICATE_GUARD_PASS")
 
+      val batchCount = new AtomicInteger(); val batchFirst = new CountDownLatch(1)
+      val batchLast = new CountDownLatch(1)
+      val batchWork = Future(daemon.getBlocksIpcStreaming(ids, callback(batchCount, batchFirst, batchLast)))
+      val batchRef = submitted.poll(5, TimeUnit.SECONDS); assert(batchRef != null)
+      batchRef.send(IpcBlocksReady(Vector(IpcBlockReady(1, None, None),
+        IpcBlockReady(1, None, Some("duplicate")),
+        IpcBlockReady(0, Some(IpcBlock(1, IpcPoolSlice("/test", 0, 1))), None))))
+      Await.result(batchWork, 5.seconds)
+      assert(batchCount.get() == 2 && batchFirst.getCount == 0 && batchLast.getCount == 0)
+      println("BATCH_COMPLETION_REAL_RPC_ORDER_AND_DUPLICATE_GUARD_PASS")
+
       val lateCount = new AtomicInteger(); val early = new CountDownLatch(1); val late = new CountDownLatch(1)
       val timeout = Future(daemon.getBlocksIpcStreaming(ids, callback(lateCount, early, late)))
       val lateRef = submitted.poll(5, TimeUnit.SECONDS); assert(lateRef != null)

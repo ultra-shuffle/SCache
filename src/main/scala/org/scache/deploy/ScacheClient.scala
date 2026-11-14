@@ -95,6 +95,9 @@ class ScacheClient(
   private lazy val ubPoolFetchSlots = new Semaphore(ubPoolFetchParallelism)
   private lazy val ubPoolBatchReadEnabled =
     conf.getBoolean("scache.ub.pool.batchRead.enabled", false)
+  private lazy val batchPublish = conf.getBoolean("scache.ub.metadata.batchPublish", false)
+  private lazy val batchReservations = conf.getBoolean("scache.ub.metadata.batchReservations", false)
+  private lazy val batchNotifications = conf.getBoolean("scache.ub.metadata.batchNotifications", false)
   // Queue pending fetches before they occupy an OS thread. A cached execution context plus
   // acquire() inside each Future creates one parked thread per block, not per active READ.
   private lazy val ubPoolFetchExecutionContext =
@@ -367,9 +370,21 @@ class ScacheClient(
       }
     case PutBlocks(msgs) =>
       doAsync[Seq[Boolean]](s"Batch read ${msgs.size} blocks from daemon", context) {
-        msgs.map { case PutBlock(blockId, size, ipc) =>
+        val started = System.nanoTime()
+        try {
+        if (batchPublish && ubSharedPoolEnabled && msgs.forall(_.ipc.isInstanceOf[IpcPoolSlice])) {
+          val results = msgs.map { case PutBlock(id, size, ipc) =>
+            readBlockFromDaemon(context, id, size, ipc, deferDirectory = true)
+          }
+          val published = msgs.zip(results).collect { case (msg, true) => msg.scacheBlockId }
+          blockManager.reportExternalBlocks(published)
+          published.grouped(256).foreach(g => ubSharedTransport.get.recordDirectoryPublish(g.size))
+          results
+        } else msgs.map { case PutBlock(blockId, size, ipc) =>
           readBlockFromDaemon(context, blockId, size, ipc)
         }
+        } finally if (ubSharedPoolEnabled) ubSharedTransport.get.recordPipelineTime(
+          "producerCommit", System.nanoTime() - started)
       }
     case RegisterShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask) =>
       context.reply(registerShuffle(appName, jobId, shuffleId, numMapTask, numReduceTask))
@@ -412,12 +427,23 @@ class ScacheClient(
       } else {
         // Reserving a long batch must not hold the RPC endpoint while releases/heartbeats wait.
         doAsync[Boolean](s"Start streaming IPC batch of ${blockIds.size} blocks", context) {
-          val deliver: (Int, Try[Option[IpcBlock]]) => Unit = (index, outcome) => outcome match {
-              case Success(result) => replyTo.send(IpcBlockReady(index, result, None))
-              case Failure(error) => replyTo.send(IpcBlockReady(index, None,
-                Some(error.getClass.getName + ": " + Option(error.getMessage).getOrElse(""))))
-            }
-          if (ubPoolBatchReadEnabled) streamUbPoolBatched(blockIds, deliver)
+          def message(index: Int, outcome: Try[Option[IpcBlock]]): IpcBlockReady = outcome match {
+            case Success(result) => IpcBlockReady(index, result, None)
+            case Failure(error) => IpcBlockReady(index, None,
+              Some(error.getClass.getName + ": " + Option(error.getMessage).getOrElse("")))
+          }
+          val deliver: (Int, Try[Option[IpcBlock]]) => Unit = (index, outcome) => {
+            ubSharedTransport.get.recordIpcCompletion(1)
+            ubSharedTransport.get.timedPipeline("ipcSend") { replyTo.send(message(index, outcome)) }
+          }
+          if (ubPoolBatchReadEnabled && batchNotifications) {
+            streamUbPoolGroupedNotifications(blockIds, values => {
+              ubSharedTransport.get.recordIpcCompletion(values.size)
+              ubSharedTransport.get.timedPipeline("ipcSend") {
+                replyTo.send(IpcBlocksReady(values.map { case (i, value) => message(i, value) }))
+              }
+            })
+          } else if (ubPoolBatchReadEnabled) streamUbPoolBatched(blockIds, deliver)
           else ScacheClient.streamUbPoolBatch(blockIds,
             blockId => ubPoolFetchSingleFlight(context, blockId), deliver)
           true
@@ -496,7 +522,11 @@ class ScacheClient(
   //   blockManager.asyncGetRemoteBlock(blockManagerId, bIds.toArray)
   // }
 
-  def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int, ipc: IpcLocation): Boolean= {
+  def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int, ipc: IpcLocation): Boolean =
+    readBlockFromDaemon(context, blockId, size, ipc, false)
+
+  private def readBlockFromDaemon(context: RpcCallContext, blockId: BlockId, size: Int,
+      ipc: IpcLocation, deferDirectory: Boolean): Boolean= {
     val localConsumer = isLocalConsumer(blockId)
     val storageLevel =
       if (localConsumer) daemonPutStorageLevelLocal else daemonPutStorageLevelRemote
@@ -514,8 +544,10 @@ class ScacheClient(
         try {
           val committed = ub.commitPoolBlock(blockId, poolPath, offset, size)
           if (!committed) return false
-          val registered = blockManager.registerExternalBlock(
-            blockId, size, StorageLevel.MEMORY_ONLY, tellMaster = true)
+          val registered = blockManager.registerExternalBlockDeferred(
+            blockId, size, StorageLevel.MEMORY_ONLY, tellMaster = true,
+            deferMasterReport = deferDirectory)
+          if (registered && !deferDirectory) ub.recordDirectoryPublish(1)
           if (!registered) {
             ub.unpublishBlock(blockId)
           }
@@ -1057,10 +1089,11 @@ class ScacheClient(
   private def streamUbPoolBatched(
       blockIds: Seq[BlockId], deliver: (Int, Try[Option[IpcBlock]]) => Unit): Unit = {
     val ub = ubSharedTransport.get
+    if (batchReservations) reserveConsumerBatch(blockIds)
     val owned = mutable.ArrayBuffer.empty[(BlockId, Promise[Option[IpcBlock]])]
     blockIds.zipWithIndex.foreach { case (id, index) =>
       try {
-        ub.reservePoolConsumer(id)
+        if (!batchReservations) ub.reservePoolConsumer(id)
         try {
           val p = Promise[Option[IpcBlock]]()
           val existing = ubPoolFetches.putIfAbsent(id.toString, p.future)
@@ -1078,8 +1111,10 @@ class ScacheClient(
       val claims = chunk.toVector
       def finish(id: BlockId, p: Promise[Option[IpcBlock]], result: Try[Option[IpcBlock]]): Unit =
         ScacheClient.finishUbPoolFetch(ubPoolFetches, id.toString, p, result)
+      val enqueued = System.nanoTime()
       try {
         Future {
+          ub.recordPipelineTime("fetchQueue", System.nanoTime() - enqueued)
           ScacheClient.acquireUbPoolSlot(ubPoolFetchSlots)
           try {
             val pending = claims.filter { case (id, p) =>
@@ -1092,7 +1127,9 @@ class ScacheClient(
               }
             }
             if (pending.nonEmpty) {
-              val locations = blockManagerMaster.getLocations(pending.map(_._1).toArray)
+              val locations = ub.timedPipeline("directoryLookup") {
+                blockManagerMaster.getLocations(pending.map(_._1).toArray)
+              }
               require(locations.size == pending.size, "UB batch directory reply size mismatch")
               val routed = pending.zip(locations).map { case ((id, p), owners) =>
                 val owner = owners.find(_ != blockManager.blockManagerId).getOrElse(
@@ -1100,7 +1137,9 @@ class ScacheClient(
                 (owner, id, p)
               }
               routed.groupBy(_._1).foreach { case (owner, children) =>
-                val slices = ub.fetchBlocksToPool(owner.host, owner.port, children.map(_._2.toString))
+                val slices = ub.timedPipeline("fetchToPool") {
+                  ub.fetchBlocksToPool(owner.host, owner.port, children.map(_._2.toString))
+                }
                 require(slices.size == children.size, "UB batch result size mismatch")
                 children.zip(slices).foreach { case ((_, id, p), value) =>
                   finish(id, p, Success(value.map(slice => IpcBlock(slice.length,
@@ -1116,6 +1155,106 @@ class ScacheClient(
           case Success(_) =>
         }
       } catch { case NonFatal(e) => claims.foreach { case (id, p) => finish(id, p, Failure(e)) } }
+    }
+  }
+
+  private def reserveConsumerBatch(ids: Seq[BlockId]): Unit = {
+    val ub = ubSharedTransport.get
+    val reserved = mutable.ArrayBuffer.empty[BlockId]
+    try ids.grouped(256).foreach { group =>
+      ub.reservePoolConsumers(group); reserved ++= group
+    } catch {
+      case NonFatal(e) => reserved.foreach(ub.cancelPoolConsumer); throw e
+    }
+  }
+
+  /** Complete each bounded work group immediately, not the whole request. Owned claims do
+    * not schedule two additional Future callbacks per block. Duplicate single-flight readers
+    * still get their own reserved reference and their own completion index.
+    */
+  private def streamUbPoolGroupedNotifications(blockIds: Seq[BlockId],
+      deliver: Vector[(Int, Try[Option[IpcBlock]])] => Unit): Unit = {
+    val ub = ubSharedTransport.get
+    if (batchReservations) reserveConsumerBatch(blockIds)
+    val owned = mutable.ArrayBuffer.empty[(BlockId, Int, Promise[Option[IpcBlock]])]
+    def cancelFailed(id: BlockId, value: Try[Option[IpcBlock]]): Unit = value match {
+      case Success(Some(IpcBlock(_, _: IpcPoolSlice))) =>
+      case _ => ub.cancelPoolConsumer(id)
+    }
+    blockIds.zipWithIndex.foreach { case (id, index) =>
+      var reserved = batchReservations
+      try {
+        if (!reserved) { ub.reservePoolConsumer(id); reserved = true }
+        val p = Promise[Option[IpcBlock]]()
+        val existing = ubPoolFetches.putIfAbsent(id.toString, p.future)
+        if (existing == null) owned += ((id, index, p))
+        else existing.onComplete { value =>
+          cancelFailed(id, value); deliver(Vector(index -> value))
+        }
+      } catch { case NonFatal(e) =>
+        if (reserved) ub.cancelPoolConsumer(id)
+        deliver(Vector(index -> Failure(e)))
+      }
+    }
+    owned.grouped(16).foreach { chunk =>
+      val claims = chunk.toVector
+      val enqueued = System.nanoTime()
+      def runGroup(): Unit = {
+        ub.recordPipelineTime("fetchQueue", System.nanoTime() - enqueued)
+        val results = mutable.Map.empty[Int, Try[Option[IpcBlock]]]
+        try {
+          ScacheClient.acquireUbPoolSlot(ubPoolFetchSlots)
+          try {
+            val pending = claims.filter { case (id, index, _) =>
+              ub.localPoolBlock(id) match {
+                case Some(s) => results(index) = Success(Some(IpcBlock(s.length,
+                  IpcPoolSlice(s.path, s.offset, s.length)))); false
+                case None => true
+              }
+            }
+            if (pending.nonEmpty) {
+              val locations = ub.timedPipeline("directoryLookup") {
+                blockManagerMaster.getLocations(pending.map(_._1).toArray)
+              }
+              require(locations.size == pending.size, "UB directory size mismatch")
+              val routed = pending.zip(locations).map { case ((id, index, p), owners) =>
+                val owner = owners.find(_ != blockManager.blockManagerId).getOrElse(
+                  throw new IllegalStateException("No UB remote owner for " + id))
+                (owner, id, index, p)
+              }
+              routed.groupBy(_._1).foreach { case (owner, children) =>
+                val slices = ub.timedPipeline("fetchToPool") {
+                  ub.fetchBlocksToPool(owner.host, owner.port, children.map(_._2.toString))
+                }
+                require(slices.size == children.size, "UB result size mismatch")
+                children.zip(slices).foreach { case ((_, _, index, _), slice) =>
+                  results(index) = Success(slice.map(s => IpcBlock(s.length,
+                    IpcPoolSlice(s.path, s.offset, s.length))))
+                }
+              }
+            }
+          } finally ubPoolFetchSlots.release()
+        } catch { case NonFatal(e) =>
+          claims.foreach { case (_, i, _) => if (!results.contains(i)) results(i) = Failure(e) }
+        }
+        val settled = claims.map { case (id, index, p) =>
+          val value = results(index)
+          cancelFailed(id, value)
+          ScacheClient.finishUbPoolFetch(ubPoolFetches, id.toString, p, value)
+          index -> value
+        }
+        deliver(settled)
+      }
+      try ubPoolFetchExecutionContext.execute(new Runnable { def run(): Unit = runGroup() })
+      catch { case NonFatal(e) =>
+        val failed = claims.map { case (id, i, p) =>
+          ub.cancelPoolConsumer(id)
+          val value = Failure(e)
+          ScacheClient.finishUbPoolFetch(ubPoolFetches, id.toString, p, value)
+          i -> value
+        }
+        deliver(failed)
+      }
     }
   }
 
