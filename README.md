@@ -6,12 +6,19 @@ The previous (upstream-style) README is archived as `README.old.md`.
 
 ## Dependencies (local git repos)
 
-SCache now depends on these repositories being present at the following paths:
+The UltraShuffle workspace pins these sibling repositories:
 
-- `${HOME}/hadoop/`: [Hadoop](https://github.com/XingZYu/hadoop)
-- `${HOME}/spark-3.5/`: [Spark](https://github.com/XingZYu/spark-3.5-scache)
-- `${HOME}/spark-apps/`: [Spark Apps](https://github.com/XingZYu/spark-apps)
-- `${HOME}/spark-apps/HiBench-7.1.1/`: [HiBench Suite](https://github.com/XingZYu/hibench)
+- `../hadoop/`: [Hadoop](https://github.com/ultra-shuffle/hadoop)
+- `../spark-3.5-scache/`: [Spark](https://github.com/ultra-shuffle/spark-3.5-scache)
+- `../spark-apps/`: [Spark Apps](https://github.com/ultra-shuffle/spark-apps)
+- `../hibench/`: [HiBench Suite](https://github.com/ultra-shuffle/hibench)
+
+Active `conf/scache.conf` and `conf/slaves` are machine-local and ignored by Git.
+After a fresh clone, run `python3 scripts/workspace.py setup` from the workspace root,
+or copy `conf/scache.conf.example` and `conf/slaves.example` to the active filenames.
+Existing configurations are preserved. Review them before starting any service.
+The historical commands below use `$HOME` as an example workspace location;
+substitute your actual workspace root.
 
 ## Build
 

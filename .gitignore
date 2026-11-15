@@ -9,4 +9,7 @@ tmp/
 .vscode/
 native/*.so
 conf/*.orig
+# Machine-specific active configuration; initialize from the example templates.
+/conf/scache.conf
+/conf/slaves
 scache-multinode.zip
