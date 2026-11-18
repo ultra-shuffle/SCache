@@ -1829,11 +1829,15 @@ private[ub] object UBBlockTransferService {
       forceSharedCommit: Boolean = false,
       checksumEnabled: Boolean = true) {
     require(arenaCount > 0, "arenaCount must be positive")
+    // A negative hint skips the retry scan. Positive hits still use the original owner check.
+    private val entryPresence = new ConcurrentHashMap[String, java.lang.Integer]()
     private val arenas: Vector[RegisteredArena] = Vector.tabulate[RegisteredArena](arenaCount) { index =>
-      new RegisteredArena(
+      val arena = new RegisteredArena(
         transport, bytesPerArena, nodeId, epoch, leaseTimeoutMs,
         sharedDirectory.map(dir => sharedArenaFile(dir, nodeId, epoch, index)),
         forceSharedCommit, checksumEnabled)
+      arena.entryPresence = entryPresence
+      arena
     }
     val capacity: Int = bytesPerArena
     val totalCapacity: Long = bytesPerArena.toLong * arenaCount
@@ -1863,8 +1867,9 @@ private[ub] object UBBlockTransferService {
       // Spark retries a map task with the same logical ShuffleBlockId after an earlier attempt
       // committed the slice but failed later in the task.  Reclaim that exact stale slice before
       // reserving its replacement; the common non-retry path is still one containsBlock lookup.
-      arenas.find(_.containsBlock(blockId)).foreach(
-        _.discardForRetry(blockId, ownerPeer, leaseTimeoutMs))
+      if (entryPresence.containsKey(blockId))
+        arenas.find(_.containsBlock(blockId)).foreach(
+          _.discardForRetry(blockId, ownerPeer, leaseTimeoutMs))
       val target: RegisteredArena = arenas.find(_.canAllocate(length))
         .getOrElse(throw exhaustion("shared prepare"))
       target.prepareShared(blockId, length, ownerPeer)
@@ -2018,6 +2023,20 @@ private[ub] object UBBlockTransferService {
         ownerPeer: String, var state: String)
     private val free = new java.util.TreeMap[Integer, Integer]()
     private val entries = scala.collection.mutable.HashMap.empty[String, Entry]
+    private[ub] var entryPresence: ConcurrentHashMap[String, java.lang.Integer] = _
+    private def markPresent(blockId: String): Unit = {
+      if (entryPresence != null && !entries.contains(blockId)) {
+        entryPresence.compute(blockId, (_, count) =>
+          java.lang.Integer.valueOf(if (count == null) 1 else count.intValue + 1))
+      }
+    }
+    private def markAbsent(blockId: String): Unit = {
+      if (entryPresence != null) {
+        entryPresence.computeIfPresent(blockId, (_, count) =>
+          if (count.intValue == 1) null else java.lang.Integer.valueOf(count.intValue - 1))
+      }
+    }
+
     private val leases = scala.collection.mutable.HashMap.empty[String, Lease]
     private val releasedLeases = scala.collection.mutable.LinkedHashMap.empty[String, (Long, String)]
     private var nextGeneration = 1L
@@ -2033,6 +2052,7 @@ private[ub] object UBBlockTransferService {
       val entry = Entry(blockId, slice, generation(),
         if (checksumEnabled) crc(target, bytes.length) else -1L, 0, 1, Allocated, 0, bytes.length)
       entry.state = Published
+      markPresent(blockId)
       entries.put(blockId, entry)
     }
     def acquire(blockId: String, ownerPeer: String = "local-contract"): Option[Descriptor] = synchronized {
@@ -2073,6 +2093,7 @@ private[ub] object UBBlockTransferService {
       val entry = Entry(blockId, allocate(length), generation(), expectedCrc, flags, replication, Writing, 1, length)
       val leaseId = UUID.randomUUID().toString; val now = System.nanoTime()
       val lease = Lease(leaseId, entry, now, now + leaseTimeoutMs.toLong * 1000000L, ownerPeer, "WRITING")
+      markPresent(blockId)
       entries.put(blockId, entry); leases.put(leaseId, lease); descriptor(entry, leaseId)
     }
 
@@ -2106,6 +2127,7 @@ private[ub] object UBBlockTransferService {
         }
         // All metadata allocated before exposing any of the new entries.
         created.foreach { case (entry, lease) =>
+          markPresent(entry.blockId)
           entries.put(entry.blockId, entry); leases.put(lease.leaseId, lease)
         }
         created.map { case (entry, _) => PoolSlice(sharedPath.get,
@@ -2113,7 +2135,10 @@ private[ub] object UBBlockTransferService {
       } catch {
         case NonFatal(e) =>
           created.foreach { case (entry, lease) =>
-            entries.remove(entry.blockId); leases.remove(lease.leaseId)
+            if (entries.get(entry.blockId).exists(_ eq entry)) {
+              entries.remove(entry.blockId); markAbsent(entry.blockId)
+            }
+            leases.remove(lease.leaseId)
           }
           releaseSlice(span)
           throw e
@@ -2368,7 +2393,9 @@ private[ub] object UBBlockTransferService {
       if (providerOutstanding != 0) throw new IllegalStateException(
         s"timed out draining $providerOutstanding provider requests")
       entries.values.foreach(entry => releaseSlice(entry.slice))
+      val closedIds = if (entryPresence != null) entries.keysIterator.toVector else Vector.empty
       entries.clear()
+      closedIds.foreach(markAbsent)
       transport.unregisterBuffer(registration)
       registrationClosed = true
     }
@@ -2412,6 +2439,7 @@ private[ub] object UBBlockTransferService {
       // or remove a newer entry that happens to have the same logical block ID.
       if (!entries.get(entry.blockId).exists(_ eq entry)) return
       entries.remove(entry.blockId)
+      markAbsent(entry.blockId)
       leases.retain { case (_, lease) => lease.entry ne entry }
       releaseSlice(entry.slice); notifyAll()
     }
